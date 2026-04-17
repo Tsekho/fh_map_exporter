@@ -1,7 +1,12 @@
 prompt*
-export/
 .etc/
 bin/
 obj/
 _*.py
 __*
+
+# Ignore export/ but keep the stitched PNGs in export/_final/
+/export/*
+!/export/_final/
+/export/_final/*
+!/export/_final/*.png

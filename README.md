@@ -1,14 +1,20 @@
 # Foxhole Map Exporter
 
-Python pipeline for exporting and processing maps from [Foxhole](https://store.steampowered.com/app/fox)
+Python pipeline for exporting and processing maps from [Foxhole](https://store.steampowered.com/app/fox).
 
 ## Pipeline
 
 ```text
-0_make_release.py     →  builds Exporter.exe from C# source
-1_export.py           →  Exporter.exe reads .pak → export/_json/, _meshes/, _heightmap/, _layers/
-2_stitch_layers.py    →  stitches per-region terrain tiles   → export/_layers_stitched/
-3_blend_example.py    →  Blender scene build     → export/_blend/<MapName>.blend
+0_make_release.py      ->  builds Exporter.exe from C# source
+1_export.py            ->  Exporter.exe reads .pak → export/_json/, _meshes/, _heightmap/, _layers/
+2_blend_all.py         ->  builds full-map Blender scenes → export/blend/<MapName>.blend
+3_blend_spills.py      ->  builds per-region .blend with 200 m neighbor spill (rocks/glaciers/
+                           landscape_meshes only; neighbor terrain excluded)
+                           → export/blend_spill/<Region>.blend
+4_render_spills.py     ->  top-down bakes per region
+                           → export/{ao,heightmap_landscape,id,water,contour}/<Region>.png
+5_finalize_exports.py  ->  stitches every bake + terrain layer into world-sized PNGs
+                           → export/_final/
 ```
 
 ## Requirements
@@ -21,11 +27,11 @@ Python pipeline for exporting and processing maps from [Foxhole](https://store.s
 
 - Python 3.10–3.13 (no `bpy` on 3.14)
 - **numpy**
-- **opencv-python** (step 2 only)
-- **bpy** / Blender Python environment (step 3 only)
+- **opencv-python** (steps 4 & 5)
+- **bpy** / Blender Python environment (steps 2–4)
 
 ```bash
-pip install numpy opencv-python
+pip install numpy opencv-python bpy
 ```
 
 ### Blender
@@ -93,35 +99,91 @@ Clears `export/` and runs `Exporter.exe` against the game `.pak`. Writes:
 python 1_export.py
 ```
 
-### Step 2 - Stitch Terrain Layers
-
-Composites the per-region 2048×2048 terrain tiles onto a single world-scale canvas using hex-shaped masks and region center coordinates.
-
-```bash
-python 2_stitch_layers.py
-```
-
-Output goes to `export/_layers_stitched/`, compatible with [map mod generator](https://github.com/Tsekho/fh_map_mod_generator).
-
-### Step 3 - Generate Blender Scenes
+### Step 2 - Generate Blender Scenes
 
 Reads JSON and meshes from `export/` and builds `.blend` files.
 
 ```bash
-# Single map (interactive selection)
-python 3_blend_example.py
-
-# Specific map
-python 3_blend_example.py SomeMapName
-
-# All maps
-python 3_blend_example.py -a
-
-# Exclude terrain
-python 3_blend_example.py -nt SomeMapName
+python 2_blend_all.py                    # interactive selection
+python 2_blend_all.py OarbreakerHex      # specific map
+python 2_blend_all.py -a                 # every map
+python 2_blend_all.py -nt OarbreakerHex  # exclude heightmap terrain
 ```
 
-Output goes to `export/_blend/`.
+Output goes to `export/blend/<MapName>.blend`.
+
+### Step 3 - Build Region Spill Scenes
+
+Generates a `.blend` file per region that includes a 200 m spill of rocks,
+glaciers and landscape meshes from each hexagonal neighbor. Only the focus
+region's terrain is included (neighbor terrain is excluded). This is the
+scene consumed by step 4.
+
+```bash
+python 3_blend_spills.py                # interactive selection
+python 3_blend_spills.py OarbreakerHex
+python 3_blend_spills.py -a
+```
+
+Output goes to `export/blend_spill/<Region>.blend`.
+
+### Step 4 - Render Region Bakes
+
+Opens each spill `.blend` and renders top-down 2048×2048 bakes per region.
+If none of `-ao` / `-hm` / `-id` is passed, all bakes are produced.
+
+```bash
+python 4_render_spills.py               # interactive selection, all bakes
+python 4_render_spills.py OarbreakerHex # one region, all bakes
+python 4_render_spills.py -a            # every region
+python 4_render_spills.py -a -hm        # only heightmap + contour
+python 4_render_spills.py -a -ao -id    # AO + id + water, skip heightmap
+```
+
+Output goes to `export/ao/`, `export/heightmap_landscape/`, `export/id/`,
+`export/water/`, `export/contour/`.
+
+### Step 5 - Finalize Exports
+
+Derives `heightmap_simple` from `heightmap_landscape`, then stitches every
+top-level bake (`ao`, `heightmap_simple`, `id`, `water`, `contour`) and
+every terrain layer folder in `export/_layers/` into world-sized PNGs.
+Per-layer tiles are re-emitted masked against the stitched id map.
+
+```bash
+python 5_finalize_exports.py
+```
+
+Output goes to `export/_final/`:
+
+```text
+export/_final/
+    ao.png
+    heightmap_simple.png
+    id.png
+    water.png
+    contour.png
+    _<layer>.png              (one per folder in export/_layers)
+    layers_masked/
+        <layer>/
+            <region>.png
+```
+
+The stitched PNGs under `export/_final/` are the only generated files
+committed to the repo (see `.gitignore`). They are compatible with the
+[map mod generator](https://github.com/Tsekho/fh_map_mod_generator).
+
+## Parallel Execution
+
+Steps 2, 3, and 4 fan out to multiple subprocesses whenever more than one
+item is queued (either via `-a` or interactive "0 = all" selection). Each
+work item runs in its own child process so every worker gets a fresh `bpy`
+state; child stdout is streamed back with a `[label]` prefix so interleaved
+output stays readable.
+
+Worker count is controlled by `NUM_WORKERS` in `utils/config.py` (default
+`4`). Set it to `1` to force serial execution in the parent process. The
+fan-out logic lives in `utils/parallel.py`.
 
 ## Project Structure
 
@@ -129,8 +191,10 @@ Output goes to `export/_blend/`.
 .
 ├── 0_make_release.py           # Builds Exporter.exe from C# source
 ├── 1_export.py                 # Runs Exporter.exe against game .pak
-├── 2_stitch_layers.py          # Stitches per-region terrain tiles
-├── 3_blend_example.py          # Generates Blender scenes
+├── 2_blend_all.py              # Generates full-map Blender scenes
+├── 3_blend_spills.py           # Generates per-region spill .blend
+├── 4_render_spills.py          # Top-down bakes per region
+├── 5_finalize_exports.py       # Stitches bakes + layers into world PNGs
 ├── Exporter/                   # C# exporter source (.NET 10, win-x64 self-contained)
 │   ├── Program.cs              # CLI entry point; sets up CUE4Parse provider
 │   ├── MapExporter.cs          # Reads .umap, resolves transforms, writes JSON + meshes
@@ -139,7 +203,9 @@ Output goes to `export/_blend/`.
 │   ├── JsonOutput.cs           # Custom compact JSON serializer
 │   └── Constants.cs            # Mesh filters, blueprint patches, name normalizations
 ├── utils/
-│   ├── converter.py            # PSK/PSKX parser, Blender helpers, Map class
+│   ├── config.py               # Shared constants: paths, tile geometry, categories, NUM_WORKERS
+│   ├── helpers.py              # PSK/PSKX parser, Blender helpers, bakers, Map class
+│   ├── parallel.py             # Subprocess fan-out helper used by the "all"/multi-item modes
 │   ├── region_centers.json     # World-space pixel coordinates of all ~55 map regions
 │   ├── mask.png                # Hex-shaped mask applied per region tile during stitching
 │   └── catalogue.json          # Partially categorized asset names
@@ -154,4 +220,4 @@ Every placed object in the exported JSON is stored as a 9-element array:
 [x, y, z, sx, sy, sz, pitch, yaw, roll]
 ```
 
-Coordinates are in Unreal Engine world-space centimetres. `utils/converter.py` converts these to Blender metres/radians using the standard UE → Blender coordinate mapping. Rotations are in degrees.
+Coordinates are in Unreal Engine world-space centimetres. `utils/helpers.py` converts these to Blender metres/radians using the standard UE → Blender coordinate mapping. Rotations are in degrees.

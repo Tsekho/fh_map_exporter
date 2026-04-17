@@ -14,37 +14,41 @@ import subprocess
 import shutil
 import json
 import sys
-from pathlib import Path
 
-PAK    = r"C:\Program Files (x86)\Steam\steamapps\common\Foxhole\War\Content\Paks\War-WindowsNoEditor.pak"
-EXPORT = "export"
-
-EXE = Path(__file__).parent.resolve() / "Exporter.exe"
+from utils.config import EXPORT_DIR, EXPORTER_EXE, FOXHOLE_PAK, JSON_DIR, MESHES_DIR
 
 
 def main() -> int:
-    if Path(EXPORT).exists():
-        shutil.rmtree(EXPORT)
+    if not EXPORTER_EXE.exists():
+        print(f"ERROR: Exporter.exe not found: {EXPORTER_EXE}")
+        return 1
 
-    subprocess.run([str(EXE), "-i", PAK, "-o", EXPORT, "-t"])
+    if EXPORT_DIR.exists():
+        shutil.rmtree(EXPORT_DIR)
 
-    json_path = Path(EXPORT) / "_json" / "HomeRegionW.json"
+    result = subprocess.run(
+        [str(EXPORTER_EXE), "-i", str(FOXHOLE_PAK), "-o", str(EXPORT_DIR), "-t"]
+    )
+    if result.returncode != 0:
+        print(f"\nERROR: Exporter.exe failed (exit code {result.returncode})")
+        return result.returncode
+
+    json_path = JSON_DIR / "HomeRegionW.json"
     if not json_path.exists():
         print(f"ERROR: JSON not found: {json_path}")
         return 1
 
     data = json.loads(json_path.read_text(encoding="utf-8"))
-    mesh_dir = Path(EXPORT) / "_meshes"
-    n_meshes  = len(list(mesh_dir.rglob("*.pskx"))) if mesh_dir.exists() else 0
-    n_meshes_ = len(list(mesh_dir.rglob("*.psk")))  if mesh_dir.exists() else 0
+    n_pskx = len(list(MESHES_DIR.rglob("*.pskx"))) if MESHES_DIR.exists() else 0
+    n_psk  = len(list(MESHES_DIR.rglob("*.psk")))  if MESHES_DIR.exists() else 0
 
     print()
     print("=== RESULTS ===")
     print(f"  symbols    : {len(data.get('symbols',    [])):>6} mesh types")
     print(f"  groups     : {len(data.get('groups',     [])):>6} mesh types")
     print(f"  blueprints : {len(data.get('blueprints', [])):>6} class types")
-    print(f"  meshes     : {n_meshes:>6} .pskx files in {mesh_dir}")
-    print(f"  meshes     : {n_meshes_:>6} .psk  files in {mesh_dir}")
+    print(f"  meshes     : {n_pskx:>6} .pskx files in {MESHES_DIR}")
+    print(f"  meshes     : {n_psk:>6} .psk  files in {MESHES_DIR}")
     print(f"  JSON       : {json_path}  ({json_path.stat().st_size / 1024:.0f} KB)")
     return 0
 

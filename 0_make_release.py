@@ -13,13 +13,13 @@ Usage:
 import subprocess
 import sys
 import shutil
-from pathlib import Path
 
-REPO_ROOT   = Path(__file__).parent.resolve()
-PROJECT_DIR = REPO_ROOT / "Exporter"
-PROJECT     = PROJECT_DIR / "Exporter.csproj"
-OUTPUT_DIR  = PROJECT_DIR / "bin" / "Release" / "net10.0" / "win-x64" / "publish"
-DEST        = REPO_ROOT / "Exporter.exe"
+from utils.config import (
+    EXPORTER_EXE,
+    EXPORTER_PROJECT,
+    EXPORTER_PUBLISH_DIR,
+    EXPORTER_RID,
+)
 
 
 def run(cmd: list[str], **kwargs) -> int:
@@ -29,17 +29,17 @@ def run(cmd: list[str], **kwargs) -> int:
 
 
 def main() -> int:
-    if not PROJECT.exists():
-        print(f"ERROR: project file not found: {PROJECT}")
+    if not EXPORTER_PROJECT.exists():
+        print(f"ERROR: project file not found: {EXPORTER_PROJECT}")
         return 1
 
     print("=== Building Exporter (Release / win-x64 / single-file) ===")
 
     rc = run([
         "dotnet", "publish",
-        str(PROJECT),
+        str(EXPORTER_PROJECT),
         "-c", "Release",
-        "-r", "win-x64",
+        "-r", EXPORTER_RID,
         "--self-contained", "true",
         "-p:PublishSingleFile=true",
         "-p:EnableCompressionInSingleFile=true",
@@ -52,15 +52,15 @@ def main() -> int:
         print(f"\nERROR: dotnet publish failed (exit code {rc})")
         return rc
 
-    published = OUTPUT_DIR / "Exporter.exe"
+    published = EXPORTER_PUBLISH_DIR / "Exporter.exe"
     if not published.exists():
         print(f"ERROR: expected output not found: {published}")
         return 1
 
-    shutil.copy2(published, DEST)
-    size_mb = DEST.stat().st_size / (1024 * 1024)
+    shutil.copy2(published, EXPORTER_EXE)
+    size_mb = EXPORTER_EXE.stat().st_size / (1024 * 1024)
     print(f"\n=== SUCCESS ===")
-    print(f"  {DEST}  ({size_mb:.1f} MB)")
+    print(f"  {EXPORTER_EXE}  ({size_mb:.1f} MB)")
     return 0
 
 
