@@ -33,13 +33,10 @@ SPILL_DIR           = EXPORT_DIR / "blend_spill"
 
 AO_DIR              = EXPORT_DIR / "ao"
 HM_LANDSCAPE_DIR    = EXPORT_DIR / "heightmap_landscape"
-HM_SIMPLE_DIR       = EXPORT_DIR / "heightmap_simple"
 ID_DIR              = EXPORT_DIR / "id"
 WATER_DIR           = EXPORT_DIR / "water"
-CONTOUR_DIR         = EXPORT_DIR / "contour"
 
 FINAL_DIR           = EXPORT_DIR / "_final"
-LAYERS_MASKED_DIR   = EXPORT_DIR / "layers_masked"
 
 
 # ------------------------------------------------------------------------------
@@ -100,3 +97,47 @@ CATEGORY_COLORS: Dict[str, str] = {
 
 # Terrain category in BGR (OpenCV) order; equals CATEGORY_COLORS["terrain"].
 TERRAIN_BGR: Tuple[int, int, int] = (0, 255, 0)
+
+# Per-layer colors used by 5_finalize_exports.py when compositing the
+# terrain weightmap layers under export/_layers/<layer>/ into a single
+# materials.png. Keys match the layer folder names (case-insensitive
+# lookup at consume time). Layers not listed here get a deterministic
+# random bright color assigned at runtime.
+#
+# "_default" is a special entry: the fallback color used for terrain
+# pixels that aren't claimed by any layer. Black is reserved for
+# non-terrain pixels and must not be used here.
+LAYER_COLORS: Dict[str, str] = {
+    "K":            "#E2DAC7",
+    "Grass":        "#FFF9E5",
+    "a":            "#FFF9E5",
+    "Snow":         "#EFEFEF",
+    "SnowRough":    "#EFEFEF",
+    "WetSand":      "#FFEBD6",
+    "b":            "#FFEBD6",
+    "Dirt":         "#FFEBD6",
+    "Sand":         "#FFEBD6",
+    "Extra02":      "#FFEBD6",
+    "Rock":         "#A3A3A3",
+    "Stone":        "#A3A3A3",
+    "Cobble2":      "#A3A3A3",
+    "D":            "#A3A3A3",
+    "Ice":          "#F9F2FF",
+    "Road":         "#E8CFB4",
+    "TownStone":    "#E8CFB4",
+    "Highway":      "#E8CFB4",
+    "DataLayer__":  "#E8CFB4",
+    "E":            "#E8CFB4",
+    "G":            "#E8CFB4",
+    "MuddyGround":  "#E8CFB4",
+    "TrenchDirt":   "#E8CFB4",
+}
+
+ID_RECOLOR: Dict[str, str] = {
+    "water":            "#A8D5FF",
+    "terrain":          "#E2DAC7",
+    "rocks":            "#797B89",
+    "glaciers":         "#FFFFFF",
+    "landscape_meshes": "#D5C7D8",
+    "deep_water":       "#C6C0B1"
+}

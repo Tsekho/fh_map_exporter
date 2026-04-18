@@ -10,36 +10,21 @@ writes PNGs:
 
     -ao   ->  export/ao/<Region>.png                   AO (Cycles, hex-masked)
     -hm   ->  export/heightmap_landscape/<R>.png       16-bit heightmap (raycast)
-              export/contour/<Region>.png              contour lines (RGBA)
     -id   ->  export/id/<Region>.png                   category ID map
               export/water/<Region>.png                binary water mask
 
 Heightmap rules:
     Rays see terrain (focus region only) + rocks + glaciers + landscape_meshes
-    from both focus and neighbor spill regions.  Water and deep water are NOT
-    part of the BVH, so rays passing over water simply miss and the pixel
-    stays at 0 (void).
+    from both focus and neighbor spill regions. Water and deep water are not
+    part of the BVH, so rays passing over water miss and the pixel stays at 0.
 
 ID map rules:
     Rays see terrain (focus region only) + rocks + glaciers + landscape_meshes
     (focus + neighbor spill) + deep_water (colored with the "water" color).
     Surface water is excluded so it never occludes meshes below it.
 
-Contour rules:
-    Stepwise black lines drawn where the heightmap's // 250 step value is
-    one greater than the step value of any 4-neighbor pixel.  Only drawn
-    where the ID map equals the terrain color (#00FF00); everywhere else
-    the contour PNG is transparent.
-
 Usage:
     python 4_render_spills.py [RegionName] [-a] [-ao] [-hm] [-id]
-
-Examples:
-    python 4_render_spills.py                   # interactive selection, all bakes
-    python 4_render_spills.py -a                # every .blend, all bakes
-    python 4_render_spills.py OarbreakerHex     # one region, all bakes
-    python 4_render_spills.py -a -hm            # only heightmap + contour
-    python 4_render_spills.py -a -ao -id        # AO + id + water, skip heightmap
 """
 
 import argparse
@@ -56,11 +41,9 @@ from utils.config import (
     AO_DIR,
     CATEGORY_COLORS,
     CATEGORY_NAMES,
-    CONTOUR_DIR,
     HM_LANDSCAPE_DIR,
     ID_DIR,
     NUM_WORKERS,
-    TERRAIN_BGR,
     MASK_FILE,
     SPILL_DIR,
     WATER_DIR,
@@ -74,20 +57,12 @@ from utils.helpers import (
 from utils.parallel import run_parallel_subprocesses
 
 
-# ------------------------------------------------------------------------------
-#  Collection inspection
-# ------------------------------------------------------------------------------
-
-
-#  Categories that spill in from neighbor regions.  Neighbor terrain and
-#  neighbor water are intentionally excluded by 3_blend_spills.py, so those
-#  buckets stay focus-only.
+# Categories spilled in from neighbor regions (neighbor terrain/water are
+# excluded by 3_blend_spills.py).
 _SPILL_CATEGORIES = ("rocks", "glaciers", "landscape_meshes")
 
-# Blender collection names are globally unique, so when neighbor regions
-# try to create sub-collections named "rocks" / "glaciers" / "landscape_meshes"
-# that already exist under the focus region, Blender silently renames them to
-# "rocks.001", "glaciers.001", etc.  Strip that numeric suffix when matching.
+# Blender auto-renames duplicate collection names to "<name>.001"; strip
+# that when matching neighbor-region spill buckets to focus buckets.
 _DATA_SUFFIX_RE = re.compile(r"\.\d{3}$")
 
 
@@ -99,18 +74,9 @@ def _collect_focus_objects(
     region_name: str,
 ) -> Optional[Dict[str, List[bpy.types.Object]]]:
     """
-    Walk the opened .blend and return ``{category: [objects, ...]}``.
-
-    Focus categories (``terrain``, ``water``, ``deep_water``, ``rocks``,
-    ``glaciers``, ``landscape_meshes``) come from the top-level children of
-    the region root collection.  Neighbor spill regions live as separate
-    top-level collections (siblings of the focus root under the scene
-    collection); for every such sibling, the spill categories in
-    ``_SPILL_CATEGORIES`` are folded into the matching focus bucket so
-    the border seams between adjacent hexes are covered by neighbor
-    rocks / glaciers / landscape meshes.
-
-    Returns ``None`` when the expected region root collection is missing.
+    Return ``{category: [objects, ...]}`` for the focus region, folding in
+    neighbor-region spill objects for ``_SPILL_CATEGORIES``. Returns None
+    when the region root collection is missing.
     """
     root = bpy.data.collections.get(region_name)
     if root is None:
@@ -139,57 +105,6 @@ def _collect_focus_objects(
         )
         print(f"  Neighbor spill folded in: {summary}")
     return buckets
-
-
-# ------------------------------------------------------------------------------
-#  Contour generation
-# ------------------------------------------------------------------------------
-
-
-def _generate_contour(hm_path: Path, id_path: Path, out_path: Path) -> None:
-    """
-    Build a contour PNG (RGBA, same size as the heightmap):
-
-        step       = heightmap_uint16 // 250
-        contour    = step(px) is exactly 1 greater than step of some 4-neighbor
-        terrain    = id pixel equals #00FF00
-
-    Output is opaque black where (contour AND terrain), transparent otherwise.
-    """
-    hm = cv2.imread(str(hm_path), cv2.IMREAD_UNCHANGED)
-    if hm is None:
-        raise FileNotFoundError(f"heightmap not found: {hm_path}")
-    if hm.dtype != np.uint16:
-        hm = hm.astype(np.uint16)
-
-    id_img = cv2.imread(str(id_path), cv2.IMREAD_COLOR)  # BGR
-    if id_img is None:
-        raise FileNotFoundError(f"id map not found: {id_path}")
-    terrain = (
-        (id_img[..., 0] == TERRAIN_BGR[0])
-        & (id_img[..., 1] == TERRAIN_BGR[1])
-        & (id_img[..., 2] == TERRAIN_BGR[2])
-    )
-
-    step = (hm // 250).astype(np.int32)
-
-    # Compare each pixel against its 4 neighbors (shift by 1 in every direction).
-    # A pixel is a contour iff at least one neighbor has step == step(px) - 1.
-    contour = np.zeros(step.shape, dtype=bool)
-    contour[1:, :]  |= (step[1:, :]  - step[:-1, :]) == 1
-    contour[:-1, :] |= (step[:-1, :] - step[1:,  :]) == 1
-    contour[:, 1:]  |= (step[:, 1:]  - step[:, :-1]) == 1
-    contour[:, :-1] |= (step[:, :-1] - step[:, 1:])  == 1
-
-    draw = contour & terrain & (hm > 0)
-
-    h, w = hm.shape
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[draw, 3] = 255  # RGB stays (0,0,0)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out_path), rgba)
-    print(f"  Contour saved -> {out_path}")
 
 
 # ------------------------------------------------------------------------------
@@ -264,36 +179,12 @@ def render_one(
             print(f"  [WARN] ID/water bake failed: {exc}")
             ok = False
 
-    # Contour depends on the heightmap and the ID map (both are needed in
-    # their on-disk form).  We always trigger it when -hm is requested; if
-    # the ID PNG is missing, contour is silently skipped with a warning.
-    if do_hm:
-        try:
-            hm_path = HM_LANDSCAPE_DIR / f"{region_name}.png"
-            id_path = ID_DIR / f"{region_name}.png"
-            out_path = CONTOUR_DIR / f"{region_name}.png"
-            if hm_path.is_file() and id_path.is_file():
-                print("[bake] contour ...")
-                _generate_contour(hm_path, id_path, out_path)
-            else:
-                missing = []
-                if not hm_path.is_file():
-                    missing.append(str(hm_path))
-                if not id_path.is_file():
-                    missing.append(str(id_path))
-                print(f"  [WARN] contour skipped (missing: {', '.join(missing)})")
-        except Exception as exc:
-            print(f"  [WARN] contour generation failed: {exc}")
-            ok = False
-
     if do_ao:
         try:
             print("[bake] AO ...")
-            # Surface water: fully hidden from the render.
-            # Deep water: visible to the camera (so it bakes as white) but
-            # invisible to every secondary ray, so the AO shader can't
-            # "see" the huge deep-water plane sitting above the terrain
-            # and therefore won't blacken everything underneath it.
+            # Surface water fully hidden; deep water visible to camera
+            # (bakes as white) but invisible to secondary rays so it
+            # doesn't blacken the terrain below.
             _ray_keys = (
                 "diffuse", "glossy", "transmission",
                 "volume_scatter", "shadow",
@@ -353,10 +244,7 @@ def pick_region_interactive(blends: List[Path]) -> Optional[List[Path]]:
 
 
 def ask_bakes() -> Tuple[bool, bool, bool]:
-    """
-    Prompt for bake selection.  Empty answer = all.  Otherwise pick any
-    combination of tokens from {ao, hm, id}.
-    """
+    """Prompt for bake selection. Empty = all; else any of {ao, hm, id}."""
     while True:
         raw = input(
             "Select bakes (space-separated from: ao hm id; empty = all): "
@@ -379,7 +267,7 @@ def ask_bakes() -> Tuple[bool, bool, bool]:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Render bakes for every region .blend in export/blend_spill.  "
+            "Render bakes for every region .blend in export/blend_spill. "
             "If none of -ao / -hm / -id is given, all bakes are produced."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -395,7 +283,7 @@ def main() -> int:
     parser.add_argument("-ao", dest="do_ao", action="store_true",
                         help="Render the AO bake")
     parser.add_argument("-hm", dest="do_hm", action="store_true",
-                        help="Render the heightmap and the contour overlay")
+                        help="Render the heightmap")
     parser.add_argument("-id", dest="do_id", action="store_true",
                         help="Render the ID map and the binary water mask")
     args = parser.parse_args()
@@ -405,7 +293,6 @@ def main() -> int:
         print(f"ERROR: no .blend files found in {SPILL_DIR}")
         return 1
 
-    # Pick subset -------------------------------------------------------------
     interactive_bakes = False
     if args.all:
         targets = blends
@@ -425,7 +312,6 @@ def main() -> int:
         targets = picked
         interactive_bakes = True
 
-    # Bakes -------------------------------------------------------------------
     if args.do_ao or args.do_hm or args.do_id:
         do_ao, do_hm, do_id = args.do_ao, args.do_hm, args.do_id
     elif interactive_bakes:
@@ -437,7 +323,6 @@ def main() -> int:
         print("ERROR: every bake was disabled; nothing to do")
         return 1
 
-    # Mask --------------------------------------------------------------------
     if not MASK_FILE.is_file():
         print(f"ERROR: mask not found at {MASK_FILE}")
         return 1
@@ -452,7 +337,6 @@ def main() -> int:
           f"(ao={do_ao}, hm={do_hm}, id={do_id}, "
           f"workers={NUM_WORKERS if parallel else 1}) ===")
 
-    # Parallel fan-out --------------------------------------------------------
     if parallel:
         def _cmd(blend: Path) -> List[str]:
             argv = [sys.executable, str(Path(__file__).resolve()), blend.stem]
@@ -476,7 +360,6 @@ def main() -> int:
         print(f"\n=== SUCCESS ===")
         return 0
 
-    # Serial path -------------------------------------------------------------
     failed: List[str] = []
     for blend in targets:
         try:

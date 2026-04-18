@@ -8,5 +8,4 @@ __*
 # Ignore export/ but keep the stitched PNGs in export/_final/
 /export/*
 !/export/_final/
-/export/_final/*
-!/export/_final/*.png
+!/export/_layers_collection/

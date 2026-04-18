@@ -11,7 +11,6 @@ Usage:
 """
 
 import subprocess
-import shutil
 import json
 import sys
 
@@ -22,9 +21,6 @@ def main() -> int:
     if not EXPORTER_EXE.exists():
         print(f"ERROR: Exporter.exe not found: {EXPORTER_EXE}")
         return 1
-
-    if EXPORT_DIR.exists():
-        shutil.rmtree(EXPORT_DIR)
 
     result = subprocess.run(
         [str(EXPORTER_EXE), "-i", str(FOXHOLE_PAK), "-o", str(EXPORT_DIR), "-t"]

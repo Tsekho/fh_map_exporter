@@ -12,8 +12,9 @@ Python pipeline for exporting and processing maps from [Foxhole](https://store.s
                            landscape_meshes only; neighbor terrain excluded)
                            → export/blend_spill/<Region>.blend
 4_render_spills.py     ->  top-down bakes per region
-                           → export/{ao,heightmap_landscape,id,water,contour}/<Region>.png
-5_finalize_exports.py  ->  stitches every bake + terrain layer into world-sized PNGs
+                           → export/{ao,heightmap_landscape,id,water}/<Region>.png
+5_finalize_exports.py  ->  derives heightmap products, stitches every bake + terrain
+                           layer into world-sized PNGs
                            → export/_final/
 ```
 
@@ -136,19 +137,58 @@ If none of `-ao` / `-hm` / `-id` is passed, all bakes are produced.
 python 4_render_spills.py               # interactive selection, all bakes
 python 4_render_spills.py OarbreakerHex # one region, all bakes
 python 4_render_spills.py -a            # every region
-python 4_render_spills.py -a -hm        # only heightmap + contour
+python 4_render_spills.py -a -hm        # only heightmap
 python 4_render_spills.py -a -ao -id    # AO + id + water, skip heightmap
 ```
 
 Output goes to `export/ao/`, `export/heightmap_landscape/`, `export/id/`,
-`export/water/`, `export/contour/`.
+`export/water/`.
 
 ### Step 5 - Finalize Exports
 
-Derives `heightmap_simple` from `heightmap_landscape`, then stitches every
-top-level bake (`ao`, `heightmap_simple`, `id`, `water`, `contour`) and
-every terrain layer folder in `export/_layers/` into world-sized PNGs.
-Per-layer tiles are re-emitted masked against the stitched id map.
+This step only writes stitched world-sized PNGs; it never produces
+per-region intermediates. Heightmap-derived products are computed
+per-tile in memory and pasted directly onto world canvases.
+
+World-sized products derived from `heightmap_landscape`:
+
+- `heightmap_highs` - 1 shade = +0.5 m above the 10 m split (0 below / void)
+- `heightmap_lows` - 1 shade = -0.5 m below the 10 m split (0 above / void)
+- `curvature_peaks` - positive half of the 2D Laplacian of elevation
+- `curvature_dips` - negative half of the 2D Laplacian of elevation
+- `slopes` - slope magnitude as a black RGBA overlay (alpha 0 = flat,
+  alpha saturates at 64 for any slope ≥ ~14°, capping opacity at ~25%)
+- `fly_alert` - textured RGBA overlay built from
+  `utils/fly_alert_pattern.png`: pattern RGB is passed through and an
+  elevation coefficient (0 at 90 m, 1 at 100 m+) multiplies the
+  pattern's alpha, so the pattern only shows through where terrain is
+  high enough. The pattern is tiled to the world canvas size if needed.
+- `contour` - stepwise black RGBA overlay built from the 16-bit
+  heightmap (`step = hm // 250`), drawn where a pixel's step is
+  exactly one greater than a 4-neighbor, masked to terrain id pixels
+
+Stitched step-4 bakes (`ao`, `id`, `water`) are emitted as BGRA with
+alpha = 0 outside the stitched hex mask. `slopes`, `fly_alert` and
+`contour` are emitted as RGBA overlays with transparent backgrounds.
+
+Two recolored products are also written from the stitched id/water
+canvases using `ID_RECOLOR` from `utils/config.py`:
+
+- `terrain_recolor.png` - id pixels remapped via `ID_RECOLOR` for every
+  category except water (water becomes transparent; out-of-bounds is
+  transparent).
+- `water_recolor.png` - solid `ID_RECOLOR["water"]` wherever the water
+  mask is > 0, transparent elsewhere.
+
+Every terrain layer folder in `export/_layers/` is composited into a
+single `shades.png`. Each layer gets a color from `LAYER_COLORS` in
+`utils/config.py` (or a deterministic random bright color if not
+listed), and layers are combined via "alpha betting": the layer with
+the highest intensity at a pixel claims it and paints that pixel with
+its color. Layers are masked to land pixels only (terrain id with water
+excluded); pixels not claimed by any layer stay fully transparent. The
+final image is saved as BGRA, and the resolved layer -> color mapping
+is written to `shades_palette.json`.
 
 ```bash
 python 5_finalize_exports.py
@@ -159,14 +199,19 @@ Output goes to `export/_final/`:
 ```text
 export/_final/
     ao.png
-    heightmap_simple.png
+    heightmap_highs.png
+    heightmap_lows.png
+    curvature_peaks.png
+    curvature_dips.png
+    slopes.png
+    fly_alert.png
     id.png
     water.png
+    terrain_recolor.png
+    water_recolor.png
     contour.png
-    _<layer>.png              (one per folder in export/_layers)
-    layers_masked/
-        <layer>/
-            <region>.png
+    shades.png
+    shades_palette.json
 ```
 
 The stitched PNGs under `export/_final/` are the only generated files
@@ -208,6 +253,7 @@ fan-out logic lives in `utils/parallel.py`.
 │   ├── parallel.py             # Subprocess fan-out helper used by the "all"/multi-item modes
 │   ├── region_centers.json     # World-space pixel coordinates of all ~55 map regions
 │   ├── mask.png                # Hex-shaped mask applied per region tile during stitching
+│   ├── fly_alert_pattern.png   # BGRA texture sampled by step 5's fly_alert overlay
 │   └── catalogue.json          # Partially categorized asset names
 └── CUE4Parse/                  # Git submodule - Unreal Engine asset reader
 ```
