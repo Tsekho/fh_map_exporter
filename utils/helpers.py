@@ -2035,18 +2035,28 @@ def build_region_with_spill(
         "water", []
     )
 
-    # Dedup lookup: some rocks / glaciers / landscape meshes are placed by
-    # the game in both adjacent regions' data, producing two near-identical
-    # copies at the border.  The duplicates z-fight under the AO bake and
-    # render as heavy artifacts.  Two placements are considered duplicates
-    # when they share the same mesh + scale + rotation (rounded to 3 dp)
-    # and lie within ``DEDUP_XY_TOL`` meters on the XY plane.  Inter-region
-    # coordinate rounding can drift by > 1 m, so a strict match isn't
-    # enough: we use a 2 m spatial bucket grid and check the 3x3 neighbor
-    # cells around each neighbor placement.
+    # Dedup lookup: rocks / glaciers / landscape meshes can be duplicated
+    # in two distinct ways, both of which z-fight under the AO bake and
+    # render as heavy artifacts:
+    #
+    #   1. **Same-source dupes** — a single map's JSON occasionally places
+    #      the exact same mesh twice at (nearly) the same spot.  When such
+    #      a map is loaded as a neighbor it spills both copies into every
+    #      render that includes it, propagating the artifact to 2–3 maps.
+    #      These are tight (< 0.1 m) and are collapsed per source.
+    #   2. **Cross-source dupes** — the game places "shared" border assets
+    #      in both adjacent regions' data.  Inter-region coordinate
+    #      rounding can drift by > 1 m, so these need a wider tolerance
+    #      (1.5 m) than self-dupes.
+    #
+    # A placement is considered a duplicate of another when they share the
+    # same mesh + scale + rotation (rounded to 3 dp) and lie within the
+    # relevant XY tolerance.  We use a 2 m spatial bucket grid and check
+    # the 3×3 neighbor cells around each candidate.
     DEDUP_CATS = ("rocks", "glaciers", "landscape_meshes")
-    DEDUP_XY_TOL = 1.5
-    DEDUP_BUCKET = 2.0  # cell size must be >= tolerance
+    SELF_DEDUP_XY_TOL = 0.1
+    CROSS_DEDUP_XY_TOL = 1.5
+    DEDUP_BUCKET = 2.0  # cell size must be >= the largest tolerance used
 
     def _dedup_shape_key(o: bpy.types.Object) -> Tuple:
         return (
@@ -2059,37 +2069,87 @@ def build_region_with_spill(
             round(o.rotation_euler.z, 3),
         )
 
-    # shape_key -> {(ix, iy): [(x, y), ...]}
-    focus_buckets: Dict[Tuple, Dict[Tuple[int, int],
-                                    List[Tuple[float, float]]]] = {}
-    for _cat in DEDUP_CATS:
-        for _o in focus_category_objs.get(_cat, []):
-            _sk = _dedup_shape_key(_o)
-            _ix = int(_o.location.x // DEDUP_BUCKET)
-            _iy = int(_o.location.y // DEDUP_BUCKET)
-            focus_buckets.setdefault(_sk, {}).setdefault(
-                (_ix, _iy), []
-            ).append((_o.location.x, _o.location.y))
+    def _bucket_index(o: bpy.types.Object) -> Tuple[int, int]:
+        return (
+            int(o.location.x // DEDUP_BUCKET),
+            int(o.location.y // DEDUP_BUCKET),
+        )
 
-    _tol_sq = DEDUP_XY_TOL * DEDUP_XY_TOL
-
-    def _is_duplicate(o: bpy.types.Object) -> bool:
-        sk = _dedup_shape_key(o)
-        cells = focus_buckets.get(sk)
+    def _has_hit_within(
+        sk: Tuple,
+        ox: float,
+        oy: float,
+        ix: int,
+        iy: int,
+        buckets: Dict[Tuple, Dict[Tuple[int, int], List[Tuple[float, float]]]],
+        tol_sq: float,
+    ) -> bool:
+        cells = buckets.get(sk)
         if not cells:
             return False
-        ix = int(o.location.x // DEDUP_BUCKET)
-        iy = int(o.location.y // DEDUP_BUCKET)
-        ox, oy = o.location.x, o.location.y
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 pts = cells.get((ix + dx, iy + dy))
                 if not pts:
                     continue
                 for px, py in pts:
-                    if (px - ox) ** 2 + (py - oy) ** 2 <= _tol_sq:
+                    if (px - ox) ** 2 + (py - oy) ** 2 <= tol_sq:
                         return True
         return False
+
+    def _dedup_within_source(
+        cat_objs: Dict[str, List[bpy.types.Object]],
+    ) -> Tuple[int, Dict[Tuple, Dict[Tuple[int, int],
+                                     List[Tuple[float, float]]]]]:
+        """
+        Collapse near-identical placements that live in the same source
+        (focus map or a single neighbor).  Uses ``SELF_DEDUP_XY_TOL``.
+        Returns ``(removed_count, surviving_buckets)`` where the buckets
+        are keyed by shape and hold the XY of surviving objects (for
+        downstream cross-source checks).
+        """
+        tol_sq = SELF_DEDUP_XY_TOL * SELF_DEDUP_XY_TOL
+        buckets: Dict[Tuple, Dict[Tuple[int, int],
+                                  List[Tuple[float, float]]]] = {}
+        removed = 0
+        for cat in DEDUP_CATS:
+            kept: List[bpy.types.Object] = []
+            for o in cat_objs.get(cat, []):
+                sk = _dedup_shape_key(o)
+                ix, iy = _bucket_index(o)
+                ox, oy = o.location.x, o.location.y
+                if _has_hit_within(sk, ox, oy, ix, iy, buckets, tol_sq):
+                    bpy.data.objects.remove(o, do_unlink=True)
+                    removed += 1
+                    continue
+                buckets.setdefault(sk, {}).setdefault(
+                    (ix, iy), []
+                ).append((ox, oy))
+                kept.append(o)
+            if cat in cat_objs:
+                cat_objs[cat] = kept
+        return removed, buckets
+
+    # Collapse self-dupes inside the focus map first so the cross-source
+    # bucket is built from the deduplicated set.
+    focus_self_removed, focus_buckets = _dedup_within_source(
+        focus_category_objs
+    )
+    if focus_self_removed:
+        print(
+            f"  dedup (focus self): {focus_self_removed} "
+            f"duplicate placement(s) removed"
+        )
+
+    _cross_tol_sq = CROSS_DEDUP_XY_TOL * CROSS_DEDUP_XY_TOL
+
+    def _collides_with_focus(o: bpy.types.Object) -> bool:
+        sk = _dedup_shape_key(o)
+        ix, iy = _bucket_index(o)
+        return _has_hit_within(
+            sk, o.location.x, o.location.y, ix, iy,
+            focus_buckets, _cross_tol_sq,
+        )
 
     # -- Neighbors (spill) ----------------------------------------------------
     # Each neighbor is linked as its own top-level collection sibling of the
@@ -2162,21 +2222,33 @@ def build_region_with_spill(
             category_objects=neigh_cat_objs,
         )
 
-        # Drop neighbor placements that collide with a focus placement of
-        # the same mesh at the same world-space XY (duplicate rocks at the
-        # shared border).  Keeping only one copy removes the z-fighting
-        # that produces AO bake artifacts.
-        removed = 0
+        # Two-stage dedup for this neighbor:
+        #   1. Collapse self-dupes inside the neighbor's own source first
+        #      (tight 0.1 m tolerance).  Some maps ship duplicated rocks
+        #      in their own JSON; without this, those dupes would spill
+        #      into the focus render and z-fight under AO.
+        #   2. Drop any remaining neighbor placement that collides with a
+        #      focus placement of the same mesh at the same world-space
+        #      XY (wider 1.5 m tolerance for cross-source drift).
+        self_removed, _ = _dedup_within_source(neigh_cat_objs)
+        cross_removed = 0
         for _cat in DEDUP_CATS:
+            kept: List[bpy.types.Object] = []
             for _o in neigh_cat_objs.get(_cat, []):
-                if _is_duplicate(_o):
+                if _collides_with_focus(_o):
                     bpy.data.objects.remove(_o, do_unlink=True)
-                    removed += 1
+                    cross_removed += 1
+                else:
+                    kept.append(_o)
+            if _cat in neigh_cat_objs:
+                neigh_cat_objs[_cat] = kept
+
+        removed = self_removed + cross_removed
         placed_n -= removed
         if removed:
             print(
                 f"  placed {placed_n:,} spill object(s) from {neigh_name} "
-                f"({removed} duplicate(s) removed)"
+                f"({self_removed} self-dup, {cross_removed} focus-dup removed)"
             )
         else:
             print(f"  placed {placed_n:,} spill object(s) from {neigh_name}")
