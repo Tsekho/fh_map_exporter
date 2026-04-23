@@ -1,77 +1,9 @@
-"""
-5_finalize_exports.py
-========
-Consolidate every per-region bake into a single world-sized export directory.
+"""Stitch step-4 bakes into world PNGs and assemble final composites.
 
-Only stitched world-sized PNGs are written; no per-region intermediates
-are produced by this script.
-
-Steps:
-    1. Stitch the top-level bakes (ao / id / water) emitted by step 4.
-       ao / id / water are written as BGRA where alpha = 0 outside the
-       stitched hex mask (pixels not covered by any region tile are
-       fully transparent).
-    2. Derive world-sized products from heightmap_landscape (int16,
-       0 m == 32768 raw, 1 raw == 0.01 m, raw 0 == void). Each region's
-       tile is processed in memory and pasted onto the world canvas via
-       np.maximum:
-         - heightmap_highs: 1 shade == +0.5 m above the 10 m split.
-                value = clip(round((meters - 10) * 2), 0, 255) for meters >= 10
-                value = 0 for meters < 10 or void
-         - heightmap_lows: 1 shade == -0.5 m below the 10 m split.
-                value = clip(round((10 - meters) * 2), 0, 255) for meters <= 10
-                value = 0 for meters > 10 or void
-         - curvature_peaks: positive half of the 2D Laplacian of elevation.
-                value = clip(round(laplacian * CURV_SCALE), 0, 255) > 0
-         - curvature_dips: negative half of the 2D Laplacian of elevation.
-                value = clip(round(-laplacian * CURV_SCALE), 0, 255) > 0
-         - slopes: gradient magnitude (0 = flat, 255 = 45 deg+ slope).
-                alpha = clip(round(|grad| * SLOPE_SCALE), 0, 64)
-                emitted as RGBA solid black overlay, masked to terrain.
-         - fly_alert: alert overlay at elevation. Textured via
-                utils/fly_alert_pattern.png: pattern RGB passes through
-                directly, and the elevation ramp (0 at 90 m, 255 at
-                100 m+) multiplies the pattern's alpha as a coefficient.
-         - contour: stepwise black lines where (hm // 250) step increments
-                across a 4-neighbor boundary. Emitted as RGBA (solid
-                black, full alpha where contour is drawn), masked to
-                terrain pixels only.
-       Curvature is m/m^2; slope magnitude is dimensionless. Pixels
-       adjacent to void are masked out in curvature/slope outputs.
-    3. Two recolored BGRA products are emitted from the stitched
-       id / water canvases:
-         - terrain_recolor: id pixels remapped via ID_RECOLOR for every
-                category except water (water becomes transparent).
-         - water_recolor: solid ID_RECOLOR["water"] wherever water.png > 0,
-                transparent elsewhere.
-    4. Stitch every folder under export/_layers/<layer>/ and composite
-       them into a single export/_final/shades.png. Each layer is
-       assigned a color (looked up in LAYER_COLORS by name, otherwise
-       a deterministic random bright color). Layers are composited by
-       "alpha betting": at every pixel, the layer with the highest
-       intensity wins and paints that pixel with its color. Layers are
-       masked to land pixels only (terrain id with water excluded);
-       pixels not claimed by any layer stay fully transparent. The
-       final image is saved as BGRA. The layer -> color mapping is
-       written to shades_palette.json.
-
-Output tree:
-    export/
-        _final/
-            ao.png
-            heightmap_highs.png
-            heightmap_lows.png
-            curvature_peaks.png
-            curvature_dips.png
-            slopes.png
-            fly_alert.png
-            id.png
-            water.png
-            terrain_recolor.png
-            water_recolor.png
-            contour.png
-            shades.png
-            shades_palette.json
+Writes to ``export/_final/``: ``technical/`` (ao, heightmap_simple, contour),
+``assembly/`` (base_layer, beaches, roads, fly_alert, dive_alert, contours,
+rdz, ranges, bridge_aim), and verbatim ``id/``, ``split_layers/``,
+``svg_layers/``.
 
 Usage:
     python 5_finalize_exports.py
@@ -90,48 +22,78 @@ import numpy as np
 
 from utils.config import (
     AO_DIR,
-    CATEGORY_COLORS,
+    BEACHES_DIR,
     CENTRES_FILE,
+    DEEP_WATER_DEPTH,
+    DIVE_ALERT_COLOR,
     FINAL_DIR,
+    FLY_ALERT_PATTERN_FILE,
     HM_LANDSCAPE_DIR,
+    HM_WATER_DIR,
     ID_DIR,
     ID_RECOLOR,
     LAYER_COLORS,
-    TERRAIN_BGR,
     LAYERS_DIR,
     MASK_FILE,
-    PIXEL_SIZE_M,
+    RDZ_PATTERN_FILE,
+    ROADS_DIR,
+    SHADES_BLUR_KSIZE,
+    SHADES_BLUR_SIGMA,
+    SPLIT_LAYERS,
+    SPLIT_LAYERS_DIR,
+    SVG_LAYERS,
+    SVG_LAYERS_DIR,
     TILE_HALF,
-    UTILS_DIR,
-    WATER_DIR,
+    HM_SPLIT_M,
+    FLY_ALERT_MIN_M,
+    FLY_ALERT_MAX_M,
 )
 
-FLY_ALERT_PATTERN_FILE = UTILS_DIR / "fly_alert_pattern.png"
+
+# Output subdirectories inside FINAL_DIR.
+TECHNICAL_DIR = "technical"
+ASSEMBLY_DIR = "assembly"
+
+# Erosion radius (pixels) applied to the water mask when gating bridge_aim.
+BRIDGE_AIM_WATER_ERODE_PX = 25
+
+# Gaussian blur applied to the contour overlay before it lands in assembly/.
+CONTOURS_BLUR_KSIZE = 3
 
 
-# Scale applied to the 2D Laplacian of elevation (m/m^2) before clipping
-# to 8-bit. With CURV_SCALE = 50, one shade == 0.02 m/m^2, saturating at
-# ~5.1 m/m^2.
-CURV_SCALE = 50.0
+class _StepLogger:
+    """Running "[i/N] ..." step counter with uniform alignment."""
 
-# Scale applied to the gradient magnitude (rise/run) for slope alpha.
-# With SLOPE_SCALE = 255, a slope of 1.0 (45 deg) saturates to 255
-# (later clipped to 64 for the final overlay).
-SLOPE_SCALE = 255.0
+    def __init__(self) -> None:
+        self.total = 0
+        self.i = 0
 
-# Elevation (meters) at which the highs/lows split happens. Terrain
-# below this elevation goes into heightmap_lows, above into highs.
-HM_SPLIT_M = 10.0
+    def set_total(self, total: int) -> None:
+        self.total = max(total, 1)
 
-# Fly-alert elevation ramp (meters). Alpha = 0 at/below FLY_ALERT_MIN_M
-# and 255 at/above FLY_ALERT_MAX_M.
-FLY_ALERT_MIN_M = 90.0
-FLY_ALERT_MAX_M = 100.0
+    @property
+    def _w(self) -> int:
+        return len(str(self.total))
+
+    def step(self, msg: str) -> None:
+        self.i += 1
+        print(f"[{self.i:>{self._w}}/{self.total}] {msg}")
+
+    def saved(self, path: Path) -> None:
+        """Report a save as a step. Path is shown relative to FINAL_DIR."""
+        try:
+            short = path.relative_to(FINAL_DIR).as_posix()
+        except ValueError:
+            short = path.name
+        self.step(f"saved  {short}")
+
+    def info(self, msg: str) -> None:
+        """Non-counted informational line, indented to match step output."""
+        pad = " " * (self._w * 2 + 4)
+        print(f"{pad}{msg}")
 
 
-# ------------------------------------------------------------------------------
-#  Shared helpers
-# ------------------------------------------------------------------------------
+LOG = _StepLogger()
 
 
 def load_centres() -> Dict[str, Tuple[int, int]]:
@@ -162,7 +124,6 @@ def _build_tile_map(src_dir: Path) -> Dict[str, Path]:
 
 
 def _apply_hex_mask(tile: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Zero everything outside the hex mask, preserving dtype + channels."""
     if tile.ndim == 2:
         return tile * mask.astype(tile.dtype)
     return tile * mask.astype(tile.dtype)[:, :, None]
@@ -207,7 +168,6 @@ def _compute_world_alpha(
     height: int,
     width: int,
 ) -> np.ndarray:
-    """World-sized 8-bit alpha: 255 inside any hex mask, 0 elsewhere."""
     alpha = np.zeros((height, width), dtype=np.uint8)
     mask_u8 = (mask.astype(np.uint8) * 255)
     for cx, cy in centres.values():
@@ -238,52 +198,9 @@ def _write_with_alpha(
     cv2.imwrite(str(out_path), bgra)
 
 
-def _build_recolor(
-    id_canvas: np.ndarray,
-    recolor: Dict[str, str],
-    category_colors: Dict[str, str],
-    exclude: Tuple[str, ...] = (),
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Recolor an id map canvas using *recolor*. Returns
-    ``(bgr_canvas, opaque_mask)`` where ``opaque_mask`` is True wherever
-    some category painted a pixel. ``deep_water`` is handled specially:
-    step 4 paints it as pure black so pure-black id pixels map to its
-    recolor entry.
-    """
-    h, w = id_canvas.shape[:2]
-    out = np.zeros((h, w, 3), dtype=np.uint8)
-    opaque = np.zeros((h, w), dtype=bool)
-
-    pairs: list = []
-    for cat, src_hex in category_colors.items():
-        if cat in exclude:
-            continue
-        dst_hex = recolor.get(cat)
-        if dst_hex is None:
-            continue
-        pairs.append((_hex_to_bgr(src_hex), _hex_to_bgr(dst_hex)))
-
-    if "deep_water" not in exclude:
-        dw_hex = recolor.get("deep_water")
-        if dw_hex is not None:
-            pairs.append(((0, 0, 0), _hex_to_bgr(dw_hex)))
-
-    for src_bgr, dst_bgr in pairs:
-        m = (
-            (id_canvas[..., 0] == src_bgr[0])
-            & (id_canvas[..., 1] == src_bgr[1])
-            & (id_canvas[..., 2] == src_bgr[2])
-        )
-        if m.any():
-            out[m] = dst_bgr
-            opaque |= m
-    return out, opaque
-
-
-# ------------------------------------------------------------------------------
-#  Generic stitcher
-# ------------------------------------------------------------------------------
+def _write_rgba(rgba: np.ndarray, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), rgba)
 
 
 def stitch(
@@ -297,11 +214,7 @@ def stitch(
     dtype: np.dtype,
     read_flag: int,
 ) -> np.ndarray:
-    """
-    Paste every tile onto a world canvas of (height, width) and return it.
-    *channels* = 1 (grayscale) / 3 (BGR) / 4 (BGRA).
-    Overlap resolved with np.maximum.
-    """
+    """Paste every tile onto a world canvas; overlap resolved with np.maximum."""
     shape = (height, width) if channels == 1 else (height, width, channels)
     canvas = np.zeros(shape, dtype=dtype)
     total = len(centres)
@@ -343,164 +256,555 @@ def stitch(
 
 
 # ------------------------------------------------------------------------------
-#  Heightmap-derived world products (in-memory, no per-region writes)
+#  Heightmap-derived products (landscape + water)
 # ------------------------------------------------------------------------------
 
-
-def build_heightmap_products(
+def stitch_heightmap_landscape(
     centres: Dict[str, Tuple[int, int]],
     mask: np.ndarray,
     height: int,
     width: int,
-) -> Dict[str, np.ndarray]:
-    """
-    Iterate every heightmap_landscape tile, derive highs/lows/curvature/
-    slopes/fly_alert/contour in memory, and paste onto world canvases.
-
-    Contour uses each region's id.png to restrict to terrain pixels.
-
-    Returns a dict of world-sized canvases:
-        highs, lows, peaks, dips, slopes, fly_alert, contour_alpha
-    All are 8-bit grayscale; contour_alpha is the alpha channel for
-    the contour overlay (0 or 255).
-    """
-    highs = np.zeros((height, width), dtype=np.uint8)
-    lows = np.zeros((height, width), dtype=np.uint8)
-    peaks = np.zeros((height, width), dtype=np.uint8)
-    dips = np.zeros((height, width), dtype=np.uint8)
-    slopes = np.zeros((height, width), dtype=np.uint8)
-    fly_alert = np.zeros((height, width), dtype=np.uint8)
-    contour_alpha = np.zeros((height, width), dtype=np.uint8)
-
+) -> np.ndarray | None:
     if not HM_LANDSCAPE_DIR.is_dir():
         print(f"  [WARN] {HM_LANDSCAPE_DIR} not found; "
-              f"skipping heightmap derivatives")
-        return {
-            "highs": highs, "lows": lows, "peaks": peaks, "dips": dips,
-            "slopes": slopes, "fly_alert": fly_alert,
-            "contour_alpha": contour_alpha,
-        }
-
-    lap_kernel = np.array(
-        [[0.0, 1.0, 0.0],
-         [1.0, -4.0, 1.0],
-         [0.0, 1.0, 0.0]],
-        dtype=np.float32,
-    )
-    px2 = float(PIXEL_SIZE_M) ** 2
-
-    split_raw = int(round(HM_SPLIT_M * 100.0)) + 32768  # raw threshold value
-    mask_bool = mask.astype(bool)
-
+              f"skipping landscape heightmap products")
+        return None
+    print(f"\n=== stitching heightmap_landscape ===")
     hm_map = _build_tile_map(HM_LANDSCAPE_DIR)
-    id_map = _build_tile_map(ID_DIR)
-    total = len(centres)
-    placed = 0
-    print(f"\n=== heightmap derivatives ({total} regions) ===")
+    return stitch(
+        hm_map, centres, mask, height, width,
+        channels=1, dtype=np.uint16, read_flag=cv2.IMREAD_UNCHANGED,
+    )
 
-    for i, (name, (cx, cy)) in enumerate(centres.items(), 1):
-        print(f"  {i}/{total}", end="\r")
-        p = hm_map.get(name.lower())
-        if p is None:
-            continue
 
-        raw = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
-        if raw is None:
-            print(f"\n  [WARN] unreadable: {p}")
-            continue
-        if raw.dtype != np.uint16:
-            raw = raw.astype(np.uint16)
-        placed += 1
+def compute_highs_lows(
+    raw_landscape: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (highs, lows) as uint8 grayscale arrays (no disk writes)."""
+    void = raw_landscape == 0
+    meters = (raw_landscape.astype(np.float32) - 32768.0) / 100.0
+    delta = meters - HM_SPLIT_M
+    highs = np.clip(np.round(delta * 2.0), 0, 255).astype(np.uint8)
+    lows = np.clip(np.round(-delta * 2.0), 0, 255).astype(np.uint8)
+    highs[void] = 0
+    lows[void] = 0
+    return highs, lows
 
-        void = raw == 0
-        meters = (raw.astype(np.float32) - 32768.0) / 100.0
 
-        # highs / lows split at HM_SPLIT_M -----------------------------
-        delta = meters - HM_SPLIT_M
-        tile_highs = np.clip(np.round(delta * 2.0), 0, 255).astype(np.uint8)
-        tile_lows = np.clip(np.round(-delta * 2.0), 0, 255).astype(np.uint8)
-        tile_highs[void] = 0
-        tile_lows[void] = 0
+def build_fly_alert(
+    raw_landscape: np.ndarray,
+    height: int,
+    width: int,
+    rocks_cov: np.ndarray | None,
+    out_path: Path,
+) -> None:
+    print("  building fly_alert...")
+    void = raw_landscape == 0
+    meters = (raw_landscape.astype(np.float32) - 32768.0) / 100.0
+    denom = max(FLY_ALERT_MAX_M - FLY_ALERT_MIN_M, 1e-6)
+    fly_ratio = (meters - FLY_ALERT_MIN_M) / denom
+    fly_alert = np.clip(np.round(fly_ratio * 255.0), 0, 255).astype(np.uint8)
+    fly_alert[void] = 0
+    if rocks_cov is not None:
+        fly_alert = (
+            (fly_alert.astype(np.uint16) * rocks_cov.astype(np.uint16) + 127)
+            // 255
+        ).astype(np.uint8)
+    pattern = cv2.imread(str(FLY_ALERT_PATTERN_FILE), cv2.IMREAD_UNCHANGED)
+    if pattern is None:
+        print(f"  [WARN] {FLY_ALERT_PATTERN_FILE} not found; "
+              f"falling back to solid white fly_alert")
+        fly_rgba = np.zeros((height, width, 4), dtype=np.uint8)
+        fly_rgba[..., 0:3] = 255
+        fly_rgba[..., 3] = fly_alert
+    else:
+        if pattern.ndim == 2:
+            pattern = cv2.cvtColor(pattern, cv2.COLOR_GRAY2BGRA)
+        elif pattern.shape[2] == 3:
+            pattern = cv2.cvtColor(pattern, cv2.COLOR_BGR2BGRA)
+        ph, pw = pattern.shape[:2]
+        if (ph, pw) != (height, width):
+            reps_y = (height + ph - 1) // ph
+            reps_x = (width + pw - 1) // pw
+            pattern = np.tile(pattern, (reps_y, reps_x, 1))[:height, :width]
+        fly_rgba = pattern.copy()
+        coef = fly_alert.astype(np.uint16)
+        fly_rgba[..., 3] = (
+            (fly_rgba[..., 3].astype(np.uint16) * coef + 127) // 255
+        ).astype(np.uint8)
+    _write_rgba(fly_rgba, out_path)
+    LOG.saved(out_path)
 
-        # curvature ----------------------------------------------------
-        elev = np.where(void, 0.0, meters).astype(np.float32)
-        lap = cv2.filter2D(elev, cv2.CV_32F, lap_kernel,
-                           borderType=cv2.BORDER_REPLICATE) / px2
-        void_u8 = void.astype(np.uint8)
-        void_neighborhood = cv2.dilate(
-            void_u8, np.ones((3, 3), dtype=np.uint8), iterations=1,
-        ).astype(bool)
-        lap[void_neighborhood] = 0.0
-        scaled_lap = lap * CURV_SCALE
-        tile_peaks = np.clip(np.round(scaled_lap), 0, 255).astype(np.uint8)
-        tile_dips = np.clip(np.round(-scaled_lap), 0, 255).astype(np.uint8)
 
-        # slopes -------------------------------------------------------
-        gx = cv2.Sobel(elev, cv2.CV_32F, 1, 0, ksize=3,
-                       borderType=cv2.BORDER_REPLICATE) / (8.0 * PIXEL_SIZE_M)
-        gy = cv2.Sobel(elev, cv2.CV_32F, 0, 1, ksize=3,
-                       borderType=cv2.BORDER_REPLICATE) / (8.0 * PIXEL_SIZE_M)
-        slope_mag = np.hypot(gx, gy)
-        tile_slopes = np.clip(np.round(slope_mag * SLOPE_SCALE),
-                              0, 255).astype(np.uint8)
-        tile_slopes[void_neighborhood] = 0
+def build_contour(
+    raw_landscape: np.ndarray,
+    world_terrain: np.ndarray | None,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Return the contour RGBA array (black lines with alpha)."""
+    print("  building contour...")
+    void = raw_landscape == 0
+    step = (raw_landscape // 250).astype(np.int32)
+    contour = np.zeros(step.shape, dtype=bool)
+    contour[1:, :]  |= (step[1:, :]  - step[:-1, :]) == 1
+    contour[:-1, :] |= (step[:-1, :] - step[1:,  :]) == 1
+    contour[:, 1:]  |= (step[:, 1:]  - step[:, :-1]) == 1
+    contour[:, :-1] |= (step[:, :-1] - step[:, 1:])  == 1
+    contour &= ~void
+    if world_terrain is not None:
+        contour &= world_terrain
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    rgba[..., 3] = np.where(contour, 255, 0).astype(np.uint8)
+    return rgba
 
-        # fly_alert ----------------------------------------------------
-        denom = max(FLY_ALERT_MAX_M - FLY_ALERT_MIN_M, 1e-6)
-        fly_ratio = (meters - FLY_ALERT_MIN_M) / denom
-        tile_fly = np.clip(np.round(fly_ratio * 255.0), 0, 255).astype(np.uint8)
-        tile_fly[void] = 0
 
-        # contour: step(px) exactly one greater than step of a 4-neighbor
-        step = (raw // 250).astype(np.int32)
-        contour = np.zeros(step.shape, dtype=bool)
-        contour[1:, :]  |= (step[1:, :]  - step[:-1, :]) == 1
-        contour[:-1, :] |= (step[:-1, :] - step[1:,  :]) == 1
-        contour[:, 1:]  |= (step[:, 1:]  - step[:, :-1]) == 1
-        contour[:, :-1] |= (step[:, :-1] - step[:, 1:])  == 1
-        contour &= ~void
+def stitch_heightmap_water(
+    centres: Dict[str, Tuple[int, int]],
+    mask: np.ndarray,
+    height: int,
+    width: int,
+) -> np.ndarray | None:
+    if not HM_WATER_DIR.is_dir():
+        print(f"  [WARN] {HM_WATER_DIR} not found; skipping heightmap_simple")
+        return None
+    print(f"\n=== stitching heightmap_water ===")
+    hm_map = _build_tile_map(HM_WATER_DIR)
+    return stitch(
+        hm_map, centres, mask, height, width,
+        channels=1, dtype=np.uint16, read_flag=cv2.IMREAD_UNCHANGED,
+    )
 
-        # Restrict contour to terrain pixels using the id tile
-        id_path = id_map.get(name.lower())
-        if id_path is not None:
-            id_tile = cv2.imread(str(id_path), cv2.IMREAD_COLOR)
-            if id_tile is not None:
-                terrain = (
-                    (id_tile[..., 0] == TERRAIN_BGR[0])
-                    & (id_tile[..., 1] == TERRAIN_BGR[1])
-                    & (id_tile[..., 2] == TERRAIN_BGR[2])
-                )
-                contour &= terrain
-        tile_contour = np.where(contour, 255, 0).astype(np.uint8)
 
-        # Apply hex mask + paste to world canvases ---------------------
-        for tile_arr, world in (
-            (tile_highs, highs),
-            (tile_lows, lows),
-            (tile_peaks, peaks),
-            (tile_dips, dips),
-            (tile_slopes, slopes),
-            (tile_fly, fly_alert),
-            (tile_contour, contour_alpha),
-        ):
-            tile_arr[~mask_bool] = 0
-            y1, y2 = cy - TILE_HALF, cy + TILE_HALF
-            x1, x2 = cx - TILE_HALF, cx + TILE_HALF
-            dst = world[y1:y2, x1:x2]
-            np.maximum(dst, tile_arr, out=dst)
+def build_heightmap_simple(
+    raw_water: np.ndarray,
+    world_alpha: np.ndarray,
+    out_path: Path,
+) -> None:
+    print("  building heightmap_simple...")
+    void = raw_water == 0
+    meters = (raw_water.astype(np.float32) - 32768.0) / 100.0
+    simple = np.clip(np.round(60.0 + meters * 2.0), 0, 255).astype(np.uint8)
+    simple[void] = 0
+    _write_with_alpha(simple, world_alpha, out_path)
+    LOG.saved(out_path)
 
-    print(f"  {total}/{total}  ({placed} tiles placed)")
-    return {
-        "highs": highs, "lows": lows, "peaks": peaks, "dips": dips,
-        "slopes": slopes, "fly_alert": fly_alert,
-        "contour_alpha": contour_alpha,
-    }
+
+def build_dive_alert(
+    raw_landscape: np.ndarray,
+    raw_water: np.ndarray,
+    water_cov: np.ndarray,
+    world_alpha: np.ndarray,
+    rocks_cov: np.ndarray | None,
+    out_path: Path,
+) -> None:
+    """RGBA overlay coloured DIVE_ALERT_COLOR wherever submerged rocks
+    sit below a water surface. Alpha fades linearly from 255 at the
+    water surface (depth 0) to 0 at DEEP_WATER_DEPTH, then is gated by
+    (rocks_cov * water_cov)."""
+    print("  building dive_alert...")
+    height, width = raw_landscape.shape
+
+    valid = (raw_landscape != 0) & (raw_water != 0)
+    if not valid.any():
+        print("  [info] no submerged pixels; dive_alert skipped")
+        return
+
+    land_m = (raw_landscape.astype(np.float32) - 32768.0) / 100.0
+    water_m = (raw_water.astype(np.float32) - 32768.0) / 100.0
+    depth = water_m - land_m
+
+    denom = max(float(DEEP_WATER_DEPTH), 1e-6)
+    ratio = np.clip(1.0 - depth / denom, 0.0, 1.0)
+    if rocks_cov is None:
+        print("  [WARN] rocks coverage missing; dive_alert skipped")
+        return
+    gate_u16 = (
+        (rocks_cov.astype(np.uint16) * water_cov.astype(np.uint16) + 127)
+        // 255
+    )
+    alpha_f = ratio * (gate_u16.astype(np.float32) / 255.0)
+    alpha = np.clip(np.round(alpha_f * 255.0), 0, 255).astype(np.uint8)
+    alpha[~valid] = 0
+    alpha[depth <= 0] = 0
+    alpha = np.minimum(alpha, world_alpha)
+
+    dive_bgr = _hex_to_bgr(DIVE_ALERT_COLOR)
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    hit = alpha > 0
+    rgba[hit, 0] = dive_bgr[0]
+    rgba[hit, 1] = dive_bgr[1]
+    rgba[hit, 2] = dive_bgr[2]
+    rgba[..., 3] = alpha
+
+    _write_rgba(rgba, out_path)
+    LOG.saved(out_path)
 
 
 # ------------------------------------------------------------------------------
-#  Entry point
+#  Terrain/water recolor + shades (in-memory; feed base_layer)
 # ------------------------------------------------------------------------------
 
+def build_terrain_recolor(
+    id_coverage: Dict[str, np.ndarray],
+    world_alpha: np.ndarray,
+    height: int,
+    width: int,
+) -> np.ndarray | None:
+    """Weighted-blend BGR image (no alpha); uncovered in-bounds pixels
+    are filled via nearest-claimed propagation. Returns None when no
+    ID category (other than water) has coverage."""
+    colored = np.zeros((height, width, 3), dtype=np.float32)
+    weight = np.zeros((height, width), dtype=np.float32)
+    for cat, hex_color in ID_RECOLOR.items():
+        if cat == "water":
+            continue
+        cov = id_coverage.get(cat)
+        if cov is None:
+            continue
+        color = np.array(_hex_to_bgr(hex_color), dtype=np.float32)
+        cov_f = cov.astype(np.float32)
+        colored += cov_f[..., None] * color
+        weight += cov_f
+
+    out_bgr = np.zeros((height, width, 3), dtype=np.uint8)
+    hit = weight > 0
+    if not hit.any():
+        return None
+    out_bgr[hit] = np.clip(
+        colored[hit] / weight[hit, None], 0, 255
+    ).astype(np.uint8)
+    in_bounds = world_alpha > 0
+    need_fill = in_bounds & ~hit
+    if need_fill.any():
+        src_zero = (~hit).astype(np.uint8)
+        _, labels = cv2.distanceTransformWithLabels(
+            src_zero, cv2.DIST_L2, 3,
+            labelType=cv2.DIST_LABEL_PIXEL,
+        )
+        ys, xs = np.where(hit)
+        src_y = np.empty(ys.size + 1, dtype=np.int32)
+        src_x = np.empty(xs.size + 1, dtype=np.int32)
+        src_y[0] = 0; src_x[0] = 0
+        src_y[1:] = ys; src_x[1:] = xs
+        lab = np.clip(labels[need_fill].astype(np.int64), 1, ys.size)
+        out_bgr[need_fill] = out_bgr[src_y[lab], src_x[lab]]
+    return out_bgr
+
+
+def build_water_recolor(
+    water_cov: np.ndarray | None,
+    world_alpha: np.ndarray,
+    height: int,
+    width: int,
+) -> np.ndarray | None:
+    """RGBA: solid ID_RECOLOR['water'] with alpha = water_cov ∧ world_alpha."""
+    water_hex = ID_RECOLOR.get("water")
+    if water_cov is None or water_hex is None:
+        return None
+    bgr = _hex_to_bgr(water_hex)
+    rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    hit = water_cov > 0
+    rgba[hit, 0] = bgr[0]
+    rgba[hit, 1] = bgr[1]
+    rgba[hit, 2] = bgr[2]
+    rgba[..., 3] = np.minimum(water_cov, world_alpha)
+    return rgba
+
+
+def build_shades(
+    centres: Dict[str, Tuple[int, int]],
+    mask: np.ndarray,
+    height: int,
+    width: int,
+    shade_alpha: np.ndarray | None,
+) -> Tuple[np.ndarray, np.ndarray] | None:
+    """Stitch every LAYERS_DIR/<layer>/ folder and composite via
+    alpha-betting into an RGB canvas. Returns (shades_bgr, shades_alpha)
+    or None when LAYERS_DIR is missing / empty."""
+    if not LAYERS_DIR.is_dir():
+        print(f"\n[WARN] {LAYERS_DIR} not found; no per-layer stitching done")
+        return None
+    layer_dirs = sorted(d for d in LAYERS_DIR.iterdir() if d.is_dir())
+    if not layer_dirs:
+        return None
+
+    claim_mask = (shade_alpha > 0) if shade_alpha is not None else None
+    shades = np.zeros((height, width, 3), dtype=np.uint8)
+    winner_alpha = np.zeros((height, width), dtype=np.uint8)
+
+    used_colors: set = {_hex_to_bgr(c) for c in LAYER_COLORS.values()}
+    rng = random.Random(0xF0)
+
+    for layer_dir in layer_dirs:
+        layer = layer_dir.name
+        print(f"\n=== stitching layer: {layer} ===")
+        tile_map = _build_tile_map(layer_dir)
+        canvas = stitch(
+            tile_map, centres, mask, height, width,
+            channels=1, dtype=np.uint8, read_flag=cv2.IMREAD_GRAYSCALE,
+        )
+        if claim_mask is not None:
+            canvas = canvas * claim_mask.astype(np.uint8)
+        color = _assign_layer_color(layer, LAYER_COLORS, used_colors, rng)
+        print(f"  color: BGR{color}")
+        win = canvas > winner_alpha
+        if win.any():
+            shades[win] = color
+            winner_alpha[win] = canvas[win]
+
+    claimed = winner_alpha > 0
+    if claimed.any():
+        need_fill = ~claimed
+        n_need = int(need_fill.sum())
+        if n_need > 0:
+            src_zero = (~claimed).astype(np.uint8)
+            _, labels = cv2.distanceTransformWithLabels(
+                src_zero, cv2.DIST_L2, 3,
+                labelType=cv2.DIST_LABEL_PIXEL,
+            )
+            ys, xs = np.where(claimed)
+            src_y = np.empty(ys.size + 1, dtype=np.int32)
+            src_x = np.empty(xs.size + 1, dtype=np.int32)
+            src_y[0] = 0; src_x[0] = 0
+            src_y[1:] = ys; src_x[1:] = xs
+            lab = np.clip(labels[need_fill].astype(np.int64), 1, ys.size)
+            shades[need_fill] = shades[src_y[lab], src_x[lab]]
+            print(f"  filled {n_need} unassigned pixel(s) "
+                  f"with nearest shade colour (blur bleed guard)")
+
+    if SHADES_BLUR_KSIZE and SHADES_BLUR_KSIZE > 1:
+        k = int(SHADES_BLUR_KSIZE)
+        if k % 2 == 0:
+            k += 1
+        shades = cv2.GaussianBlur(shades, (k, k), float(SHADES_BLUR_SIGMA))
+
+    if shade_alpha is not None:
+        out_alpha = shade_alpha
+    else:
+        out_alpha = np.where(winner_alpha > 0, 255, 0).astype(np.uint8)
+    return shades, out_alpha
+
+
+# ------------------------------------------------------------------------------
+#  Assembly composites (the new outputs)
+# ------------------------------------------------------------------------------
+
+def _alpha_over(
+    base_rgb_f: np.ndarray,
+    top_rgb_u8: np.ndarray,
+    top_alpha_u8: np.ndarray,
+) -> np.ndarray:
+    """Return base_rgb_f with top composited over it via "normal" blending.
+    base_rgb_f is float32 (0..255); top inputs are uint8. Works in place
+    would be nice but we return a new array."""
+    a = (top_alpha_u8.astype(np.float32) / 255.0)[..., None]
+    return base_rgb_f * (1.0 - a) + top_rgb_u8.astype(np.float32) * a
+
+
+def build_base_layer(
+    terrain_recolor: np.ndarray | None,
+    shades: Tuple[np.ndarray, np.ndarray] | None,
+    highs: np.ndarray | None,
+    lows: np.ndarray | None,
+    water_recolor: np.ndarray | None,
+    ao: np.ndarray | None,
+    ground: np.ndarray,
+    world_alpha: np.ndarray,
+    out_path: Path,
+) -> None:
+    """Compose base_layer.png:
+
+        terrain_recolor (base)
+      + shades                  (normal alpha over)
+      + highs  * ground         (add)
+      + lows   * ground         (difference)
+      + water_recolor           (multiply with alpha)
+      + ao                      (multiply)
+    """
+    if terrain_recolor is None:
+        print("  [WARN] terrain_recolor unavailable; skipping base_layer")
+        return
+
+    height, width = world_alpha.shape
+    base = terrain_recolor.astype(np.float32)
+
+    if shades is not None:
+        shades_rgb, shades_alpha = shades
+        base = _alpha_over(base, shades_rgb, shades_alpha)
+
+    ground_f = ground[..., None]  # (H, W, 1), 0..1
+
+    if highs is not None:
+        add = highs.astype(np.float32)[..., None] * ground_f
+        base = np.clip(base + add, 0, 255)
+
+    if lows is not None:
+        diff_layer = lows.astype(np.float32)[..., None] * ground_f
+        base = np.abs(base - diff_layer)
+
+    if water_recolor is not None:
+        wa = (water_recolor[..., 3].astype(np.float32) / 255.0)[..., None]
+        wrgb = water_recolor[..., 0:3].astype(np.float32) / 255.0
+        # multiply-with-alpha: out = out * (wrgb * wa + (1 - wa))
+        base = base * (wrgb * wa + (1.0 - wa))
+
+    if ao is not None:
+        ao_f = (ao.astype(np.float32) / 255.0)[..., None]
+        base = base * ao_f
+
+    base = np.clip(base, 0, 255).astype(np.uint8)
+    rgba = np.dstack([base, world_alpha])
+    _write_rgba(rgba, out_path)
+    LOG.saved(out_path)
+
+
+def _load_svg_layer(name: str) -> np.ndarray | None:
+    """Load export/_final/svg_layers/<name>.png (BGRA). Returns None when
+    the stitched file hasn't been produced yet."""
+    path = FINAL_DIR / "svg_layers" / f"{name}.png"
+    if not path.is_file():
+        return None
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+    elif img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    return img
+
+
+def _composite_over(dst_rgba: np.ndarray, top_rgba: np.ndarray) -> np.ndarray:
+    """Standard Porter-Duff source-over in float32; returns uint8 RGBA."""
+    da = dst_rgba[..., 3].astype(np.float32) / 255.0
+    ta = top_rgba[..., 3].astype(np.float32) / 255.0
+    drgb = dst_rgba[..., 0:3].astype(np.float32)
+    trgb = top_rgba[..., 0:3].astype(np.float32)
+    out_a = ta + da * (1.0 - ta)
+    safe = np.maximum(out_a, 1e-6)[..., None]
+    out_rgb = (trgb * ta[..., None] + drgb * da[..., None] * (1.0 - ta[..., None])) / safe
+    out = np.zeros_like(dst_rgba)
+    out[..., 0:3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
+    out[..., 3] = np.clip(np.round(out_a * 255.0), 0, 255).astype(np.uint8)
+    return out
+
+
+def _mul_alpha(rgba: np.ndarray, coef01: np.ndarray) -> np.ndarray:
+    """Return a copy of ``rgba`` with its alpha multiplied by ``coef01``
+    (float32 in 0..1)."""
+    out = rgba.copy()
+    out[..., 3] = np.clip(
+        np.round(out[..., 3].astype(np.float32) * coef01), 0, 255,
+    ).astype(np.uint8)
+    return out
+
+
+def build_rdz(height: int, width: int, out_path: Path) -> None:
+    """rdz_pattern with svg_layers/rdz_grace punching holes in its alpha."""
+    pattern = cv2.imread(str(RDZ_PATTERN_FILE), cv2.IMREAD_UNCHANGED)
+    if pattern is None:
+        print(f"  [WARN] {RDZ_PATTERN_FILE} not found; skipping rdz")
+        return
+    if pattern.ndim == 2:
+        pattern = cv2.cvtColor(pattern, cv2.COLOR_GRAY2BGRA)
+    elif pattern.shape[2] == 3:
+        pattern = cv2.cvtColor(pattern, cv2.COLOR_BGR2BGRA)
+    ph, pw = pattern.shape[:2]
+    if (ph, pw) != (height, width):
+        reps_y = (height + ph - 1) // ph
+        reps_x = (width + pw - 1) // pw
+        pattern = np.tile(pattern, (reps_y, reps_x, 1))[:height, :width]
+
+    grace = _load_svg_layer("rdz_grace")
+    if grace is not None:
+        keep = 1.0 - (grace[..., 3].astype(np.float32) / 255.0)
+        pattern = _mul_alpha(pattern, keep)
+
+    _write_rgba(pattern, out_path)
+    LOG.saved(out_path)
+
+
+def build_ranges(
+    height: int,
+    width: int,
+    ground01: np.ndarray,
+    water01: np.ndarray,
+    out_path: Path,
+) -> None:
+    """svg_layers: tap*ground + intel + ai*ground + mh + cg*water, alpha-over."""
+    layers_gates = [
+        ("ranges_tap",   ground01),
+        ("ranges_intel", None),
+        ("ranges_ai",    ground01),
+        ("ranges_mh",    None),
+        ("ranges_cg",    water01),
+    ]
+    result = np.zeros((height, width, 4), dtype=np.uint8)
+    any_hit = False
+    for name, gate in layers_gates:
+        img = _load_svg_layer(name)
+        if img is None:
+            LOG.info(f"[skip] ranges: svg_layers/{name}.png missing")
+            continue
+        if gate is not None:
+            img = _mul_alpha(img, gate)
+        result = _composite_over(result, img)
+        any_hit = True
+    if not any_hit:
+        print("  [WARN] no range svg_layers available; skipping ranges")
+        return
+    _write_rgba(result, out_path)
+    LOG.saved(out_path)
+
+
+def build_bridge_aim(
+    water_cov: np.ndarray | None,
+    out_path: Path,
+) -> None:
+    """svg_layers/bridges_aim gated by (water eroded by 25 px)."""
+    src = _load_svg_layer("bridges_aim")
+    if src is None:
+        print("  [WARN] svg_layers/bridges_aim.png missing; skipping bridge_aim")
+        return
+    if water_cov is None:
+        print("  [WARN] water coverage unavailable; skipping bridge_aim")
+        return
+    k = 2 * BRIDGE_AIM_WATER_ERODE_PX + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    eroded = cv2.erode(water_cov, kernel)
+    gate = eroded.astype(np.float32) / 255.0
+    out = _mul_alpha(src, gate)
+    _write_rgba(out, out_path)
+    LOG.saved(out_path)
+
+
+def build_contours_assembly(
+    contour_rgba: np.ndarray,
+    ground01: np.ndarray,
+    water01: np.ndarray,
+    out_path: Path,
+) -> None:
+    """3x3 gaussian of the contour overlay with alpha multiplied by
+    (0.5 * water + ground). Produces the blurred copy consumed by the
+    map compositor."""
+    k = CONTOURS_BLUR_KSIZE
+    if k % 2 == 0:
+        k += 1
+    blurred_alpha = cv2.GaussianBlur(contour_rgba[..., 3], (k, k), 0)
+    coef = np.clip(0.5 * water01 + ground01, 0.0, 1.0)
+    out_alpha = np.clip(
+        np.round(blurred_alpha.astype(np.float32) * coef), 0, 255,
+    ).astype(np.uint8)
+    rgba = np.zeros_like(contour_rgba)
+    rgba[..., 3] = out_alpha
+    _write_rgba(rgba, out_path)
+    LOG.saved(out_path)
+
+
+# ------------------------------------------------------------------------------
+#  Main
+# ------------------------------------------------------------------------------
 
 def main() -> int:
     t0 = time.time()
@@ -517,210 +821,218 @@ def main() -> int:
 
     FINAL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # World-sized alpha: 255 inside any region tile's hex mask, 0 outside.
+    # Best-effort pre-count for "[i/N]" prefixes.
+    est = 0
+    if AO_DIR.is_dir():            est += 1  # technical/ao
+    if ROADS_DIR.is_dir():         est += 1  # assembly/roads
+    if BEACHES_DIR.is_dir():       est += 1  # assembly/beaches
+    if SPLIT_LAYERS_DIR.is_dir():
+        for _layer in SPLIT_LAYERS:
+            if (SPLIT_LAYERS_DIR / _layer).is_dir(): est += 1
+    if SVG_LAYERS_DIR.is_dir():
+        for _layer in SVG_LAYERS:
+            if (SVG_LAYERS_DIR / _layer).is_dir(): est += 1
+    if ID_DIR.is_dir():
+        est += sum(1 for d in ID_DIR.iterdir() if d.is_dir())
+    if HM_LANDSCAPE_DIR.is_dir():  est += 3  # fly_alert, contour, contours
+    if HM_WATER_DIR.is_dir():      est += 1  # heightmap_simple
+    if HM_LANDSCAPE_DIR.is_dir() and HM_WATER_DIR.is_dir():
+        est += 1  # dive_alert
+    est += 4  # base_layer, rdz, ranges, bridge_aim (may skip)
+    LOG.set_total(est)
+
     world_alpha = _compute_world_alpha(centres, mask, height, width)
 
-    # 1) Stitch the step-4 bakes (ao / id / water) -------------------------
     def _stitch_then_alpha(
         label: str,
         src_dir: Path,
         *,
         channels: int,
         read_flag: int,
-        out_name: str,
+        out_rel: str,
     ) -> np.ndarray | None:
         if not src_dir.is_dir():
-            print(f"  [WARN] {src_dir} not found; skipping {label}")
+            LOG.info(f"[skip] {label}: source dir not found ({src_dir.name})")
             return None
         print(f"\n=== stitching {label} ===")
         tile_map = _build_tile_map(src_dir)
         canvas = stitch(tile_map, centres, mask, height, width,
                         channels=channels, dtype=np.uint8,
                         read_flag=read_flag)
-        out_path = FINAL_DIR / out_name
+        out_path = FINAL_DIR / out_rel
         _write_with_alpha(canvas, world_alpha, out_path)
-        print(f"  written: {out_path}")
+        LOG.saved(out_path)
         return canvas
 
-    id_canvas = _stitch_then_alpha(
-        "id", ID_DIR, channels=3, read_flag=cv2.IMREAD_COLOR,
-        out_name="id.png",
+    # -- technical/ao (also reused for base_layer multiply) --
+    ao_canvas = _stitch_then_alpha(
+        "ao", AO_DIR, channels=1, read_flag=cv2.IMREAD_GRAYSCALE,
+        out_rel=f"{TECHNICAL_DIR}/ao.png",
+    )
+
+    # -- assembly/roads & assembly/beaches --
+    _stitch_then_alpha(
+        "roads", ROADS_DIR,
+        channels=4, read_flag=cv2.IMREAD_UNCHANGED,
+        out_rel=f"{ASSEMBLY_DIR}/roads.png",
     )
     _stitch_then_alpha(
-        "ao", AO_DIR, channels=1, read_flag=cv2.IMREAD_GRAYSCALE,
-        out_name="ao.png",
-    )
-    water_canvas = _stitch_then_alpha(
-        "water", WATER_DIR,
-        channels=1, read_flag=cv2.IMREAD_GRAYSCALE,
-        out_name="water.png",
+        "beaches", BEACHES_DIR,
+        channels=4, read_flag=cv2.IMREAD_UNCHANGED,
+        out_rel=f"{ASSEMBLY_DIR}/beaches.png",
     )
 
-    # terrain mask (world-sized) used for contour/slopes/fly_alert masking
-    if id_canvas is None:
-        print("[WARN] id canvas unavailable; terrain masking skipped")
-        world_terrain = None
+    # -- split_layers/<layer>.png (unchanged location) --
+    if SPLIT_LAYERS_DIR.is_dir():
+        for layer in SPLIT_LAYERS:
+            src = SPLIT_LAYERS_DIR / layer
+            _stitch_then_alpha(
+                f"split_layers/{layer}", src,
+                channels=4, read_flag=cv2.IMREAD_UNCHANGED,
+                out_rel=f"split_layers/{layer}.png",
+            )
     else:
-        world_terrain = (
-            (id_canvas[..., 0] == TERRAIN_BGR[0])
-            & (id_canvas[..., 1] == TERRAIN_BGR[1])
-            & (id_canvas[..., 2] == TERRAIN_BGR[2])
-        )
+        print(f"\n[WARN] {SPLIT_LAYERS_DIR} not found; "
+              f"skipping split_layer stitching")
 
-    # 2) Heightmap-derived world products (in-memory, stitched) -----------
-    hm = build_heightmap_products(centres, mask, height, width)
-
-    # highs / lows / peaks / dips -- BGRA with world_alpha
-    for key, fname in (
-        ("highs", "heightmap_highs.png"),
-        ("lows", "heightmap_lows.png"),
-        ("peaks", "curvature_peaks.png"),
-        ("dips", "curvature_dips.png"),
-    ):
-        out_path = FINAL_DIR / fname
-        _write_with_alpha(hm[key], world_alpha, out_path)
-        print(f"  written: {out_path}")
-
-    # slopes overlay: solid black, alpha = slope mag clipped to [0, 64],
-    # masked to terrain pixels so flat/water is fully transparent.
-    slopes_canvas = hm["slopes"]
-    if world_terrain is not None:
-        slopes_canvas = slopes_canvas * world_terrain.astype(np.uint8)
-    rgba = np.zeros((height, width, 4), dtype=np.uint8)
-    rgba[..., 3] = np.minimum(slopes_canvas, 64)
-    slopes_out = FINAL_DIR / "slopes.png"
-    cv2.imwrite(str(slopes_out), rgba)
-    print(f"  written: {slopes_out}")
-
-    # fly_alert overlay: textured via utils/fly_alert_pattern.png.
-    # The elevation-derived alpha (0 at FLY_ALERT_MIN_M, 255 at
-    # FLY_ALERT_MAX_M) multiplies the pattern's alpha, so the pattern's
-    # RGB shows through only where the elevation ramp is non-zero. If the
-    # pattern's size doesn't match the world canvas it is tiled to cover.
-    fly_out = FINAL_DIR / "fly_alert.png"
-    pattern = cv2.imread(str(FLY_ALERT_PATTERN_FILE), cv2.IMREAD_UNCHANGED)
-    if pattern is None:
-        print(f"  [WARN] {FLY_ALERT_PATTERN_FILE} not found; "
-              f"falling back to solid white fly_alert")
-        fly_rgba = np.zeros((height, width, 4), dtype=np.uint8)
-        fly_rgba[..., 0:3] = 255
-        fly_rgba[..., 3] = hm["fly_alert"]
+    # -- svg_layers/<layer>.png (unchanged location; consumed below) --
+    if SVG_LAYERS_DIR.is_dir():
+        for layer in SVG_LAYERS:
+            src = SVG_LAYERS_DIR / layer
+            _stitch_then_alpha(
+                f"svg_layers/{layer}", src,
+                channels=4, read_flag=cv2.IMREAD_UNCHANGED,
+                out_rel=f"svg_layers/{layer}.png",
+            )
     else:
-        if pattern.ndim == 2:
-            pattern = cv2.cvtColor(pattern, cv2.COLOR_GRAY2BGRA)
-        elif pattern.shape[2] == 3:
-            pattern = cv2.cvtColor(pattern, cv2.COLOR_BGR2BGRA)
-        ph, pw = pattern.shape[:2]
-        if (ph, pw) != (height, width):
-            reps_y = (height + ph - 1) // ph
-            reps_x = (width + pw - 1) // pw
-            pattern = np.tile(pattern, (reps_y, reps_x, 1))[:height, :width]
-        fly_rgba = pattern.copy()
-        coef = hm["fly_alert"].astype(np.uint16)
-        fly_rgba[..., 3] = (
-            (fly_rgba[..., 3].astype(np.uint16) * coef + 127) // 255
-        ).astype(np.uint8)
-    cv2.imwrite(str(fly_out), fly_rgba)
-    print(f"  written: {fly_out}")
+        print(f"\n[WARN] {SVG_LAYERS_DIR} not found; "
+              f"skipping svg_layer stitching")
 
-    # contour overlay: solid black, full alpha where step-contour is drawn.
-    contour_alpha = hm["contour_alpha"]
-    contour_rgba = np.zeros((height, width, 4), dtype=np.uint8)
-    contour_rgba[..., 3] = contour_alpha
-    contour_out = FINAL_DIR / "contour.png"
-    cv2.imwrite(str(contour_out), contour_rgba)
-    print(f"  written: {contour_out}")
-
-    # Recolor products -----------------------------------------------------
-    if id_canvas is not None:
-        terrain_bgr, terrain_opaque = _build_recolor(
-            id_canvas, ID_RECOLOR, CATEGORY_COLORS, exclude=("water",),
-        )
-        terrain_alpha = np.where(
-            terrain_opaque, world_alpha, 0
-        ).astype(np.uint8)
-        terrain_out = FINAL_DIR / "terrain_recolor.png"
-        cv2.imwrite(str(terrain_out), np.dstack([terrain_bgr, terrain_alpha]))
-        print(f"  written: {terrain_out}")
+    # -- id/<cat>.png (unchanged location) --
+    id_coverage: Dict[str, np.ndarray] = {}
+    if not ID_DIR.is_dir():
+        print(f"\n[WARN] {ID_DIR} not found; per-category ID coverage skipped")
     else:
-        print("  [WARN] id canvas unavailable; skipping terrain_recolor")
-
-    water_hex = ID_RECOLOR.get("water")
-    if water_canvas is not None and water_hex is not None:
-        water_bgr_val = _hex_to_bgr(water_hex)
-        water_rgba = np.zeros((height, width, 4), dtype=np.uint8)
-        water_hit = water_canvas > 0
-        water_rgba[water_hit] = (
-            water_bgr_val[0], water_bgr_val[1], water_bgr_val[2], 255,
-        )
-        water_rgba[..., 3] = np.minimum(water_rgba[..., 3], world_alpha)
-        water_out = FINAL_DIR / "water_recolor.png"
-        cv2.imwrite(str(water_out), water_rgba)
-        print(f"  written: {water_out}")
-    elif water_hex is None:
-        print("  [WARN] ID_RECOLOR['water'] not set; skipping water_recolor")
-    else:
-        print("  [WARN] water canvas unavailable; skipping water_recolor")
-
-    # Land mask = terrain id pixels with water excluded
-    if world_terrain is None:
-        world_land = None
-    elif water_canvas is None:
-        world_land = world_terrain
-    else:
-        world_land = world_terrain & (water_canvas == 0)
-
-    # 3) per-layer compositing -> shades.png -----------------------------
-    if not LAYERS_DIR.is_dir():
-        print(f"\n[WARN] {LAYERS_DIR} not found; no per-layer stitching done")
-    else:
-        layer_dirs = sorted(d for d in LAYERS_DIR.iterdir() if d.is_dir())
-
-        shades = np.zeros((height, width, 3), dtype=np.uint8)
-        winner_alpha = np.zeros((height, width), dtype=np.uint8)
-
-        used_colors: set = {_hex_to_bgr(c) for c in LAYER_COLORS.values()}
-        rng = random.Random(0xF0)
-        layer_palette: Dict[str, Tuple[int, int, int]] = {}
-
-        for layer_dir in layer_dirs:
-            layer = layer_dir.name
-            print(f"\n=== stitching layer: {layer} ===")
-            tile_map = _build_tile_map(layer_dir)
+        cat_dirs = sorted(d for d in ID_DIR.iterdir() if d.is_dir())
+        for cat_dir in cat_dirs:
+            cat = cat_dir.name
+            print(f"\n=== stitching id/{cat} ===")
+            tile_map = _build_tile_map(cat_dir)
+            if not tile_map:
+                print(f"  [skip] no tiles in {cat_dir}")
+                continue
             canvas = stitch(
                 tile_map, centres, mask, height, width,
-                channels=1, dtype=np.uint8, read_flag=cv2.IMREAD_GRAYSCALE,
+                channels=1, dtype=np.uint8,
+                read_flag=cv2.IMREAD_GRAYSCALE,
             )
-            if world_land is not None:
-                canvas = canvas * world_land.astype(np.uint8)
+            id_coverage[cat] = canvas
+            out_path = FINAL_DIR / "id" / f"{cat}.png"
+            _write_with_alpha(canvas, world_alpha, out_path)
+            LOG.saved(out_path)
 
-            color = _assign_layer_color(layer, LAYER_COLORS,
-                                        used_colors, rng)
-            layer_palette[layer] = color
-            print(f"  color: BGR{color}")
+    terrain_cov = id_coverage.get("terrain")
+    water_cov = id_coverage.get("water")
+    rocks_cov = id_coverage.get("rocks")
 
-            win = canvas > winner_alpha
-            if win.any():
-                shades[win] = color
-                winner_alpha[win] = canvas[win]
+    world_terrain = (terrain_cov > 0) if terrain_cov is not None else None
 
-        rgba = np.zeros((height, width, 4), dtype=np.uint8)
-        rgba[..., 0:3] = shades
-        rgba[..., 3] = np.where(winner_alpha > 0, 255, 0).astype(np.uint8)
+    # -- ground mask = terrain * (not water), 0..1 float --
+    if terrain_cov is not None:
+        if water_cov is not None:
+            non_water = (255 - water_cov).astype(np.uint16)
+            ground_u8 = (
+                (terrain_cov.astype(np.uint16) * non_water + 127) // 255
+            ).astype(np.uint8)
+        else:
+            ground_u8 = terrain_cov.copy()
+        ground_u8 = np.minimum(ground_u8, world_alpha)
+    else:
+        ground_u8 = np.zeros((height, width), dtype=np.uint8)
+    ground01 = ground_u8.astype(np.float32) / 255.0
+    water01 = (water_cov.astype(np.float32) / 255.0
+               if water_cov is not None
+               else np.zeros((height, width), dtype=np.float32))
 
-        shades_out = FINAL_DIR / "shades.png"
-        cv2.imwrite(str(shades_out), rgba)
-        print(f"\n  written: {shades_out}")
-
-        palette_out = FINAL_DIR / "shades_palette.json"
-        palette_json = {
-            layer: "#{:02X}{:02X}{:02X}".format(bgr[2], bgr[1], bgr[0])
-            for layer, bgr in layer_palette.items()
-        }
-        palette_out.write_text(
-            json.dumps(palette_json, indent=2), encoding="utf-8"
+    # -- heightmap products --
+    raw_landscape = stitch_heightmap_landscape(centres, mask, height, width)
+    highs = lows = None
+    contour_rgba = None
+    if raw_landscape is not None:
+        print(f"\n=== deriving heightmap_landscape products ===")
+        highs, lows = compute_highs_lows(raw_landscape)
+        build_fly_alert(
+            raw_landscape, height, width, rocks_cov,
+            FINAL_DIR / ASSEMBLY_DIR / "fly_alert.png",
         )
-        print(f"  written: {palette_out}")
+        contour_rgba = build_contour(
+            raw_landscape, world_terrain, height, width,
+        )
+        contour_out = FINAL_DIR / TECHNICAL_DIR / "contour.png"
+        _write_rgba(contour_rgba, contour_out)
+        LOG.saved(contour_out)
+
+    raw_water = stitch_heightmap_water(centres, mask, height, width)
+    if raw_water is not None:
+        print(f"\n=== deriving heightmap_water products ===")
+        build_heightmap_simple(
+            raw_water, world_alpha,
+            FINAL_DIR / TECHNICAL_DIR / "heightmap_simple.png",
+        )
+
+    if (
+        raw_landscape is not None
+        and raw_water is not None
+        and water_cov is not None
+    ):
+        build_dive_alert(
+            raw_landscape, raw_water, water_cov, world_alpha, rocks_cov,
+            FINAL_DIR / ASSEMBLY_DIR / "dive_alert.png",
+        )
+    else:
+        print("  [WARN] missing heightmap/water coverage; skipping dive_alert")
+
+    del raw_landscape, raw_water
+
+    # -- in-memory intermediates for base_layer --
+    print(f"\n=== assembling base_layer inputs ===")
+    terrain_recolor = (
+        build_terrain_recolor(id_coverage, world_alpha, height, width)
+        if id_coverage else None
+    )
+    water_recolor = build_water_recolor(water_cov, world_alpha, height, width)
+
+    # shade_alpha = terrain * (not water) ∧ world_alpha (same as ground_u8)
+    shade_alpha = ground_u8 if terrain_cov is not None else None
+    shades_pair = build_shades(centres, mask, height, width, shade_alpha)
+
+    # -- assembly/base_layer.png --
+    build_base_layer(
+        terrain_recolor, shades_pair, highs, lows, water_recolor, ao_canvas,
+        ground01, world_alpha,
+        FINAL_DIR / ASSEMBLY_DIR / "base_layer.png",
+    )
+
+    # -- assembly/contours.png (blurred contour with alpha gating) --
+    if contour_rgba is not None:
+        build_contours_assembly(
+            contour_rgba, ground01, water01,
+            FINAL_DIR / ASSEMBLY_DIR / "contours.png",
+        )
+
+    # -- assembly/rdz.png --
+    build_rdz(height, width, FINAL_DIR / ASSEMBLY_DIR / "rdz.png")
+
+    # -- assembly/ranges.png --
+    build_ranges(
+        height, width, ground01, water01,
+        FINAL_DIR / ASSEMBLY_DIR / "ranges.png",
+    )
+
+    # -- assembly/bridge_aim.png --
+    build_bridge_aim(
+        water_cov, FINAL_DIR / ASSEMBLY_DIR / "bridge_aim.png",
+    )
 
     print(f"\n=== SUCCESS (in {time.time() - t0:.2f}s) ===")
     return 0

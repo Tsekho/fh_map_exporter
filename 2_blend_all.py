@@ -1,48 +1,48 @@
-"""
-2_blend_all.py
-========
-Generate a .blend file from Foxhole map exports produced by Exporter.exe.
-
-Reads per-map JSON from export/_json and meshes from export/_meshes, then
-writes a Blender scene to export/blend/<MapName>.blend.
+"""Generate .blend files from Foxhole map exports.
 
 Usage:
     python 2_blend_all.py [MapName] [-nt] [-a]
-
-Examples:
-    python 2_blend_all.py OarbreakerHex
-    python 2_blend_all.py OarbreakerHex -nt
-    python 2_blend_all.py -a -nt
-    python 2_blend_all.py                   # interactive map/terrain selection
-
-Options:
-    MapName            Map name (e.g. OarbreakerHex); omit for interactive prompt
-    -nt, --no-terrain  Exclude heightmap terrain (terrain included by default)
-    -a, --all          Process every map found in export/_json
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
-from utils.config import EXPORT_DIR, JSON_DIR, NUM_WORKERS
-from utils.helpers import Map
+from utils.config import CENTRES_FILE, EXPORT_DIR, JSON_DIR, NUM_WORKERS
+from utils.map import Map
 from utils.parallel import run_parallel_subprocesses
 
 
-# ------------------------------------------------------------------------------
-#  Interactive helpers
-# ------------------------------------------------------------------------------
+def _load_region_keys() -> Set[str]:
+    """Set of lowercase region keys from region_centers.json. Used to
+    filter out non-region JSONs (e.g. MainMenu) that have no centre."""
+    if not CENTRES_FILE.is_file():
+        return set()
+    with CENTRES_FILE.open("r", encoding="utf-8") as f:
+        return {k.lower() for k in json.load(f).keys()}
+
+
+def _list_maps() -> List[str]:
+    """JSON stems that correspond to real regions (present in
+    region_centers.json)."""
+    if not JSON_DIR.is_dir():
+        return []
+    keys = _load_region_keys()
+    if not keys:
+        return sorted(p.stem for p in JSON_DIR.glob("*.json"))
+    return sorted(
+        p.stem for p in JSON_DIR.glob("*.json") if p.stem.lower() in keys
+    )
 
 
 def pick_map_interactive() -> Optional[List[str]]:
-    """Prompt the user to select a map from those found in export/_json."""
     if not JSON_DIR.is_dir():
         print(f"ERROR: {JSON_DIR} not found")
         return None
 
-    maps = sorted(p.stem for p in JSON_DIR.glob("*.json"))
+    maps = _list_maps()
     if not maps:
         print(f"ERROR: no JSON files found in {JSON_DIR}")
         return None
@@ -65,55 +65,34 @@ def pick_map_interactive() -> Optional[List[str]]:
         print("  Invalid selection, try again.")
 
 
-def ask_terrain() -> bool:
-    """Prompt the user whether to include heightmap terrain."""
-    while True:
-        raw = input("Include terrain? [Y/n]: ").strip().lower()
-        if raw in ("", "y", "yes"):
-            return True
-        if raw in ("n", "no"):
-            return False
-        print("  Please enter y or n.")
-
-
-# ------------------------------------------------------------------------------
-#  CLI entry point
-# ------------------------------------------------------------------------------
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate a .blend from Foxhole map exports.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "map_name",
-        nargs="?",
-        help="Map name (e.g. OarbreakerHex); omit for interactive selection",
-    )
-    parser.add_argument(
-        "-nt", "--no-terrain",
-        action="store_true",
-        help="Exclude heightmap terrain (terrain included by default)",
-    )
-    parser.add_argument(
-        "-a", "--all",
-        action="store_true",
-        help="Process every map found in export/_json",
-    )
+    parser.add_argument("map_name", nargs="?",
+                        help="Map name (e.g. OarbreakerHex); omit for interactive")
+    parser.add_argument("-nt", "--no-terrain", action="store_true",
+                        help="Exclude heightmap terrain")
+    parser.add_argument("-a", "--all", action="store_true",
+                        help="Process every map in export/_json")
     args = parser.parse_args()
 
-    # Resolve map list and terrain flag --------------------------------------
     if args.all:
         if not JSON_DIR.is_dir():
             print(f"ERROR: {JSON_DIR} not found")
             return 1
-        map_names = sorted(p.stem for p in JSON_DIR.glob("*.json"))
+        map_names = _list_maps()
         if not map_names:
             print(f"ERROR: no maps found in {JSON_DIR}")
             return 1
         terrain = not args.no_terrain
     elif args.map_name:
+        keys = _load_region_keys()
+        if keys and args.map_name.lower() not in keys:
+            print(f"ERROR: '{args.map_name}' is not a region "
+                  f"(missing from {CENTRES_FILE.name}); skipping")
+            return 1
         map_names = [args.map_name]
         terrain = not args.no_terrain
     else:
@@ -121,13 +100,12 @@ def main() -> int:
         if picked is None:
             return 1
         map_names = picked
-        terrain = ask_terrain()
+        terrain = not args.no_terrain
 
     parallel = len(map_names) > 1 and NUM_WORKERS > 1
     print(f"=== Building {len(map_names)} map(s) "
           f"(terrain={terrain}, workers={NUM_WORKERS if parallel else 1}) ===")
 
-    # Parallel fan-out when running more than one map --------------------------
     if parallel:
         def _cmd(name: str) -> List[str]:
             argv = [sys.executable, str(Path(__file__).resolve()), name]
@@ -135,24 +113,23 @@ def main() -> int:
                 argv.append("-nt")
             return argv
 
-        failed = run_parallel_subprocesses(
-            map_names, _cmd, workers=NUM_WORKERS,
-        )
+        failed = run_parallel_subprocesses(map_names, _cmd, workers=NUM_WORKERS)
         if failed:
             print(f"\n{len(failed)} map(s) failed: {', '.join(failed)}")
             return 1
         print(f"\n=== SUCCESS ===")
         return 0
 
-    # Serial path -------------------------------------------------------------
     errors: List[str] = []
-    for name in map_names:
+    total = len(map_names)
+    w = len(str(total))
+    for i, name in enumerate(map_names, 1):
         json_path = JSON_DIR / f"{name}.json"
         if not json_path.exists():
             print(f"ERROR: JSON not found: {json_path}")
             errors.append(name)
             continue
-        print(f"\n=== {name} ===")
+        print(f"\n=== [{i:>{w}}/{total}] {name} ===")
         try:
             Map(str(json_path), str(EXPORT_DIR)).blend(terrain=terrain)
         except Exception as exc:

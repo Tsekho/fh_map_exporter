@@ -308,7 +308,7 @@ namespace Exporter
                                           + zOffsetCm;
 
                         if (heightCm < -10_000.0) { srcPixels[y * srcW + x] = 0; continue; }
-                        
+
                         double encoded  = heightCm + 32768.0;
                         srcPixels[y * srcW + x] =
                             (ushort)Math.Clamp((int)Math.Round(encoded), 0, 65535);

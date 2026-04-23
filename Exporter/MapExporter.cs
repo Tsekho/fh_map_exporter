@@ -5,6 +5,7 @@ using System.Linq;
 using CUE4Parse.FileProvider;
 using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Assets.Exports.Component.SplineMesh;
 using CUE4Parse.UE4.Assets.Exports.Component.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
@@ -12,6 +13,7 @@ using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse.UE4.Objects.Engine;
+using CUE4Parse.UE4.Assets.Exports.Animation;
 using CUE4Parse_Conversion;
 using CUE4Parse_Conversion.Meshes;
 using Newtonsoft.Json.Linq;
@@ -28,6 +30,7 @@ namespace Exporter
         public double[] RelLoc   = [0, 0, 0];
         public double[] RelScale = [1, 1, 1];
         public double[] RelRot   = [0, 0, 0];
+        public string?  SocketName;
     }
 
     internal sealed class MapItem
@@ -51,6 +54,9 @@ namespace Exporter
         public MapItem?       CreatedBy;
         public List<MapItem>  Created = [];
 
+        // Socket on Parent's skeletal mesh this component is attached to (via SCS AttachToName).
+        public string?        SocketName;
+
         // Global (world-space) – null until Globalize() runs
         public double[]?   GlobLoc;
         public double[]?   GlobScale;
@@ -67,6 +73,10 @@ namespace Exporter
             = new(ReferenceEqualityComparer.Instance);
 
         private readonly Dictionary<string, Dictionary<string, TemplateData>> _bpTemplateCache = [];
+
+        // Cache: mesh package path → (socket name → socket transform in mesh-local space).
+        // Null value means the mesh failed to load or had no sockets.
+        private readonly Dictionary<string, Dictionary<string, (double[] loc, double[,] rot, double[] scl)>?> _socketCache = [];
 
         private readonly bool _exportTextures;
 
@@ -167,14 +177,15 @@ namespace Exporter
             var symbols    = new Dictionary<string, List<double[]>>();
             var groups     = new Dictionary<string, List<double[]>>();
             var blueprints = new Dictionary<string, List<JObject>>();
+            var splines    = new Dictionary<string, List<double[]>>();
 
             Directory.CreateDirectory(Path.Combine(_exportFolder, "_meshes"));
 
             foreach (var item in allItems)
-                if (item.Export != null) SerializeItem(item, symbols, groups, blueprints);
+                if (item.Export != null) SerializeItem(item, symbols, groups, blueprints, splines);
 
-            Log.Information("symbols={0}  groups={1}  blueprints={2}",
-                symbols.Count, groups.Count, blueprints.Count);
+            Log.Information("symbols={0}  groups={1}  blueprints={2}  splines={3}",
+                symbols.Count, groups.Count, blueprints.Count, splines.Count);
 
             // 6. Export textures (optional)
             if (_exportTextures)
@@ -189,6 +200,7 @@ namespace Exporter
                 ["symbols"]    = ToJObject(symbols),
                 ["blueprints"] = BlueprintsToJObject(blueprints),
                 ["groups"]     = ToJObject(groups),
+                ["splines"]    = ToJObject(splines),
             };
 
             string jsonDir = Path.Combine(_exportFolder, "_json");
@@ -281,6 +293,7 @@ namespace Exporter
             seenIds.Add(comp.Id);
 
             if (Constants.SkipTypes.Contains(comp.ExportType)) return;
+            if (Constants.SkipComponentNames.Contains(comp.Export.Name)) return;
 
             owner.Created.Add(comp);
         }
@@ -319,6 +332,9 @@ namespace Exporter
                     comp.RelScale = templateData.RelScale;
                 if (!compProps.Any(p => p.Name.Text == "RelativeRotation"))
                     comp.RelRot   = templateData.RelRot;
+
+                if (comp.SocketName == null && templateData.SocketName != null)
+                    comp.SocketName = templateData.SocketName;
             }
 
             var exp = item.Export;
@@ -350,6 +366,9 @@ namespace Exporter
                     comp.RelScale = templateData.RelScale;
                 if (!compProps.Any(p => p.Name.Text == "RelativeRotation"))
                     comp.RelRot   = templateData.RelRot;
+
+                if (comp.SocketName == null && templateData.SocketName != null)
+                    comp.SocketName = templateData.SocketName;
             }
         }
 
@@ -361,6 +380,35 @@ namespace Exporter
             double[]   pLoc   = item.Parent?.GlobLoc   ?? [0, 0, 0];
             double[]   pScale = item.Parent?.GlobScale  ?? [1, 1, 1];
             double[,]  pRot   = item.Parent?.GlobRot    ?? TransformMath.Identity3x3;
+
+            // If attached to a socket on the parent skeletal mesh, offset the parent
+            // transform by the socket's mesh-local transform before applying item's relative.
+            if (item.SocketName != null)
+            {
+                if (item.Parent == null)
+                {
+                    Log.Warning("[Socket] item '{0}' has SocketName='{1}' but no Parent", item.Export?.Name, item.SocketName);
+                }
+                else
+                {
+                    var sock = GetSocketMeshLocal(item.Parent.MeshIndex, item.SocketName);
+                    if (sock == null)
+                    {
+                        Log.Warning("[Socket] item '{0}': socket '{1}' not found on parent '{2}' mesh '{3}'",
+                            item.Export?.Name, item.SocketName, item.Parent.Export?.Name,
+                            ResolveMeshPath(item.Parent.MeshIndex) ?? "<null>");
+                    }
+                    else
+                    {
+                        var (sLoc, sRot, sScl) = sock.Value;
+                        var sScaled = new double[] { sLoc[0]*pScale[0], sLoc[1]*pScale[1], sLoc[2]*pScale[2] };
+                        var rv = TransformMath.MatVecMul(pRot, sScaled);
+                        pLoc   = [pLoc[0]+rv[0], pLoc[1]+rv[1], pLoc[2]+rv[2]];
+                        pRot   = TransformMath.MatMul(pRot, sRot);
+                        pScale = [pScale[0]*sScl[0], pScale[1]*sScl[1], pScale[2]*sScl[2]];
+                    }
+                }
+            }
 
             var localRot  = TransformMath.RotationMatrix(item.RelRot[0], item.RelRot[1], item.RelRot[2]);
             item.GlobRot  = TransformMath.MatMul(pRot, localRot);
@@ -395,9 +443,20 @@ namespace Exporter
             MapItem item,
             Dictionary<string, List<double[]>> symbols,
             Dictionary<string, List<double[]>> groups,
-            Dictionary<string, List<JObject>>  blueprints)
+            Dictionary<string, List<JObject>>  blueprints,
+            Dictionary<string, List<double[]>> splines)
         {
             if (item.CreatedBy != null) return;
+
+            // Spline mesh components deform a mesh along a cubic hermite spline; emit
+            // their spline parameters (in world space) so the mesh can be reconstructed
+            // downstream. Handled before the generic SkipTypes filter.
+            if (item.ExportType == "SplineMeshComponent")
+            {
+                SerializeSpline(item, splines);
+                return;
+            }
+
             if (Constants.SkipTypes.Contains(item.ExportType)) return;
             if (item.GlobLoc == null) return;
 
@@ -407,21 +466,9 @@ namespace Exporter
                 var meshDict = BuildPatchMeshDict(replacePath, item);
                 if (meshDict != null)
                 {
-                    var patchMeshProps = meshDict.Properties().Where(p => p.Name != "_self").ToList();
-                    int patchTotal = patchMeshProps.Sum(p => ((JArray)p.Value).Count);
-                    if (patchTotal == 1)
-                    {
-                        var patchSingleName  = patchMeshProps[0].Name;
-                        var patchSingleEntry = ((JArray)patchMeshProps[0].Value)[0].ToObject<double[]>()!;
-                        if (!symbols.ContainsKey(patchSingleName)) symbols[patchSingleName] = [];
-                        symbols[patchSingleName].Add(patchSingleEntry);
-                    }
-                    else
-                    {
-                        string bpn = Constants.NormaliseBPName(replacePath.Split('/').Last() + "_C");
-                        if (!blueprints.ContainsKey(bpn)) blueprints[bpn] = [];
-                        blueprints[bpn].Add(meshDict);
-                    }
+                    string bpn = Constants.NormaliseBPName(replacePath.Split('/').Last() + "_C");
+                    if (!blueprints.ContainsKey(bpn)) blueprints[bpn] = [];
+                    blueprints[bpn].Add(meshDict);
                 }
                 return;
             }
@@ -448,17 +495,6 @@ namespace Exporter
 
                 if (!hasMesh) return;
 
-                var meshProps = meshDict.Properties().Where(p => p.Name != "_self").ToList();
-                int totalPlacements = meshProps.Sum(p => ((JArray)p.Value).Count);
-                if (totalPlacements == 1)
-                {
-                    var bpSingleName  = meshProps[0].Name;
-                    var bpSingleEntry = ((JArray)meshProps[0].Value)[0].ToObject<double[]>()!;
-                    if (!symbols.ContainsKey(bpSingleName)) symbols[bpSingleName] = [];
-                    symbols[bpSingleName].Add(bpSingleEntry);
-                    return;
-                }
-
                 string bpn = Constants.NormaliseBPName(item.ExportType);
                 if (!blueprints.ContainsKey(bpn)) blueprints[bpn] = [];
                 blueprints[bpn].Add(meshDict);
@@ -482,6 +518,72 @@ namespace Exporter
                 if (!symbols.ContainsKey(meshName)) symbols[meshName] = [];
                 symbols[meshName].Add(entry);
             }
+        }
+
+        private void SerializeSpline(MapItem item, Dictionary<string, List<double[]>> splines)
+        {
+            if (item.GlobLoc == null || item.GlobRot == null || item.GlobScale == null) return;
+            if (item.Mesh == null || item.MeshIndex == null) return;
+
+            var meshName = Unpath(item.Mesh);
+            if (meshName == null || Constants.IsHardbanned(meshName)) return;
+            meshName = Constants.NormaliseMeshName(meshName);
+
+            FSplineMeshParams? sp = null;
+            try { sp = item.Export.GetOrDefault<FSplineMeshParams>("SplineParams"); }
+            catch { return; }
+            if (sp == null) return;
+
+            var axis = item.Export.GetOrDefault<ESplineMeshAxis>("ForwardAxis", ESplineMeshAxis.X);
+
+            var loc   = item.GlobLoc;
+            var rot   = item.GlobRot;
+            var scale = item.GlobScale;
+
+            double[] txPoint(double x, double y, double z)
+            {
+                var sr = new double[] { x*scale[0], y*scale[1], z*scale[2] };
+                var rt = TransformMath.MatVecMul(rot, sr);
+                return [loc[0]+rt[0], loc[1]+rt[1], loc[2]+rt[2]];
+            }
+            double[] txDir(double x, double y, double z)
+            {
+                var sr = new double[] { x*scale[0], y*scale[1], z*scale[2] };
+                return TransformMath.MatVecMul(rot, sr);
+            }
+
+            var sPos = txPoint(sp.StartPos.X, sp.StartPos.Y, sp.StartPos.Z);
+            var ePos = txPoint(sp.EndPos.X,   sp.EndPos.Y,   sp.EndPos.Z);
+            var sTan = txDir  (sp.StartTangent.X, sp.StartTangent.Y, sp.StartTangent.Z);
+            var eTan = txDir  (sp.EndTangent.X,   sp.EndTangent.Y,   sp.EndTangent.Z);
+
+            // Flat layout (23 values) - sufficient to rebuild the deformed mesh:
+            //  [0..2]   world start position
+            //  [3..5]   world start tangent
+            //  [6..8]   world end position
+            //  [9..11]  world end tangent
+            //  [12]     start roll (radians)
+            //  [13..14] start offset (x, y, component-space 2D)
+            //  [15..16] start scale  (x, y)
+            //  [17]     end roll (radians)
+            //  [18..19] end offset (x, y)
+            //  [20..21] end scale  (x, y)
+            //  [22]     forward axis: 0=X, 1=Y, 2=Z
+            var entry = new double[]
+            {
+                sPos[0], sPos[1], sPos[2],
+                sTan[0], sTan[1], sTan[2],
+                ePos[0], ePos[1], ePos[2],
+                eTan[0], eTan[1], eTan[2],
+                sp.StartRoll, sp.StartOffset.X, sp.StartOffset.Y, sp.StartScale.X, sp.StartScale.Y,
+                sp.EndRoll,   sp.EndOffset.X,   sp.EndOffset.Y,   sp.EndScale.X,   sp.EndScale.Y,
+                (int)axis,
+            };
+
+            ExportMesh(item.MeshIndex);
+
+            if (!splines.ContainsKey(meshName)) splines[meshName] = [];
+            splines[meshName].Add(entry);
         }
 
         private JObject? BuildPatchMeshDict(string replacePath, MapItem actor)
@@ -697,6 +799,11 @@ namespace Exporter
                     tdata.RelScale = [rs.X, rs.Y, rs.Z];
                     tdata.RelRot   = [rr.Pitch, rr.Yaw, rr.Roll];
 
+                    // SCS-level socket attachment (e.g. "S_cabin" on a parent skeletal mesh).
+                    var atn = exp.GetOrDefault<FName>("AttachToName");
+                    if (!atn.IsNone && !string.IsNullOrEmpty(atn.Text) && atn.Text != "None")
+                        tdata.SocketName = atn.Text;
+
                     result[ivn.Text] = tdata;
                     ownScsKeys.Add(ivn.Text);
                 }
@@ -759,7 +866,8 @@ namespace Exporter
                     {
                         foreach (var prop in cdo.Properties)
                         {
-                            // Skip only if the current class's own SCS already defines this component.
+                            // Skip if the current class's own SCS already defines this component
+                            // (keyed either by property name or by component-object name below).
                             if (ownScsKeys.Contains(prop.Name.Text)) continue;
                             if (prop.Tag == null) continue;
 
@@ -772,25 +880,183 @@ namespace Exporter
                             try { comp = compIdx.Load(); } catch { }
                             if (comp == null) continue;
                             if (Constants.SkipTypes.Contains(comp.ExportType)) continue;
+                            if (ownScsKeys.Contains(comp.Name)) continue;
 
-                            var cdoMeshIdx = comp.GetOrDefault<FPackageIndex>("StaticMesh");
-                            if (cdoMeshIdx == null || cdoMeshIdx.IsNull)
+                            // Merge with any existing template (populated by parent class's CDO/SCS).
+                            // Child CDOs often re-list inherited components without re-declaring the
+                            // mesh or transform; those inherited values must be preserved.
+                            if (!result.TryGetValue(comp.Name, out var tdata))
+                            {
+                                tdata = new TemplateData();
+                                result[comp.Name] = tdata;
+                            }
+
+                            var compProps = comp.Properties;
+
+                            FPackageIndex? cdoMeshIdx = null;
+                            if (compProps.Any(p => p.Name.Text == "StaticMesh"))
+                                cdoMeshIdx = comp.GetOrDefault<FPackageIndex>("StaticMesh");
+                            if ((cdoMeshIdx == null || cdoMeshIdx.IsNull)
+                                && compProps.Any(p => p.Name.Text == "SkeletalMesh"))
                                 cdoMeshIdx = comp.GetOrDefault<FPackageIndex>("SkeletalMesh");
+                            if (cdoMeshIdx != null && !cdoMeshIdx.IsNull)
+                                tdata.MeshIndex = cdoMeshIdx;
 
-                            var tdata = new TemplateData { MeshIndex = cdoMeshIdx };
-                            var rl = comp.GetOrDefault<FVector>("RelativeLocation",  FVector.ZeroVector);
-                            var rs = comp.GetOrDefault<FVector>("RelativeScale3D",   FVector.OneVector);
-                            var rr = comp.GetOrDefault<FRotator>("RelativeRotation", FRotator.ZeroRotator);
-                            tdata.RelLoc   = [rl.X, rl.Y, rl.Z];
-                            tdata.RelScale = [rs.X, rs.Y, rs.Z];
-                            tdata.RelRot   = [rr.Pitch, rr.Yaw, rr.Roll];
+                            if (compProps.Any(p => p.Name.Text == "RelativeLocation"))
+                            {
+                                var rl = comp.GetOrDefault<FVector>("RelativeLocation", FVector.ZeroVector);
+                                tdata.RelLoc = [rl.X, rl.Y, rl.Z];
+                            }
+                            if (compProps.Any(p => p.Name.Text == "RelativeScale3D"))
+                            {
+                                var rs = comp.GetOrDefault<FVector>("RelativeScale3D", FVector.OneVector);
+                                tdata.RelScale = [rs.X, rs.Y, rs.Z];
+                            }
+                            if (compProps.Any(p => p.Name.Text == "RelativeRotation"))
+                            {
+                                var rr = comp.GetOrDefault<FRotator>("RelativeRotation", FRotator.ZeroRotator);
+                                tdata.RelRot = [rr.Pitch, rr.Yaw, rr.Roll];
+                            }
 
-                            result[prop.Name.Text] = tdata;
+                            // Alias by the CDO property name (e.g. "Mesh") for the prop-iteration
+                            // path in PopulateBlueprintDefaults.
+                            if (!string.Equals(comp.Name, prop.Name.Text, StringComparison.Ordinal)
+                                && !result.ContainsKey(prop.Name.Text))
+                                result[prop.Name.Text] = tdata;
                         }
                     }
                 }
             }
             catch { }
+        }
+
+        // Resolve a named socket on a skeletal mesh to its transform in mesh-local space.
+        // Combines the bone's mesh-local ref-pose transform with the socket's bone-relative transform.
+        private (double[] loc, double[,] rot, double[] scl)? GetSocketMeshLocal(FPackageIndex? meshIdx, string socketName)
+        {
+            if (meshIdx == null || meshIdx.IsNull) return null;
+            var path = ResolveMeshPath(meshIdx);
+            if (path == null) return null;
+
+            if (!_socketCache.TryGetValue(path, out var cache))
+            {
+                cache = BuildSocketCache(meshIdx);
+                _socketCache[path] = cache;
+            }
+            if (cache == null) return null;
+            return cache.TryGetValue(socketName, out var xf) ? xf : null;
+        }
+
+        private static Dictionary<string, (double[] loc, double[,] rot, double[] scl)>? BuildSocketCache(FPackageIndex meshIdx)
+        {
+            USkeletalMesh? mesh;
+            try { mesh = meshIdx.Load<UObject>() as USkeletalMesh; }
+            catch { return null; }
+            if (mesh == null) return null;
+
+            var refSkel = mesh.ReferenceSkeleton;
+            if (refSkel == null) return null;
+
+            // Build mesh-local bone transforms by walking parent chain.
+            int boneCount = refSkel.FinalRefBoneInfo.Length;
+            var boneLoc   = new double[boneCount][];
+            var boneRot   = new double[boneCount][,];
+            var boneScl   = new double[boneCount][];
+            var nameToIdx = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            for (int i = 0; i < boneCount; i++)
+            {
+                var info = refSkel.FinalRefBoneInfo[i];
+                var pose = refSkel.FinalRefBonePose[i];
+
+                double[,] localRot = TransformMath.QuaternionToMatrix(pose.Rotation.X, pose.Rotation.Y, pose.Rotation.Z, pose.Rotation.W);
+                double[]  localLoc = [pose.Translation.X, pose.Translation.Y, pose.Translation.Z];
+                double[]  localScl = [pose.Scale3D.X, pose.Scale3D.Y, pose.Scale3D.Z];
+
+                int parent = info.ParentIndex;
+                if (parent < 0)
+                {
+                    boneLoc[i] = localLoc;
+                    boneRot[i] = localRot;
+                    boneScl[i] = localScl;
+                }
+                else
+                {
+                    var pL = boneLoc[parent]; var pR = boneRot[parent]; var pS = boneScl[parent];
+                    var sr = new double[] { localLoc[0]*pS[0], localLoc[1]*pS[1], localLoc[2]*pS[2] };
+                    var rv = TransformMath.MatVecMul(pR, sr);
+                    boneLoc[i] = [pL[0]+rv[0], pL[1]+rv[1], pL[2]+rv[2]];
+                    boneRot[i] = TransformMath.MatMul(pR, localRot);
+                    boneScl[i] = [pS[0]*localScl[0], pS[1]*localScl[1], pS[2]*localScl[2]];
+                }
+
+                nameToIdx[info.Name.Text] = i;
+            }
+
+            var result = new Dictionary<string, (double[] loc, double[,] rot, double[] scl)>(StringComparer.OrdinalIgnoreCase);
+
+            void ProcessSockets(FPackageIndex[]? sockets)
+            {
+                if (sockets == null) return;
+                foreach (var sIdx in sockets)
+                {
+                    if (sIdx == null || sIdx.IsNull) continue;
+                    USkeletalMeshSocket? sock;
+                    try { sock = sIdx.Load<UObject>() as USkeletalMeshSocket; }
+                    catch { continue; }
+                    if (sock == null) continue;
+
+                    string socketName = sock.SocketName.Text;
+                    if (string.IsNullOrEmpty(socketName)) continue;
+
+                    // Default: socket is in mesh-local space (bone ignored if not found / root).
+                    double[]  bL = [0, 0, 0];
+                    double[,] bR = TransformMath.Identity3x3;
+                    double[]  bS = [1, 1, 1];
+                    if (!sock.BoneName.IsNone && nameToIdx.TryGetValue(sock.BoneName.Text, out var bIdx))
+                    {
+                        bL = boneLoc[bIdx]; bR = boneRot[bIdx]; bS = boneScl[bIdx];
+                    }
+
+                    var sLocRel = new double[] { sock.RelativeLocation.X, sock.RelativeLocation.Y, sock.RelativeLocation.Z };
+                    var sRotRel = TransformMath.RotationMatrix(sock.RelativeRotation.Pitch, sock.RelativeRotation.Yaw, sock.RelativeRotation.Roll);
+                    var sSclRel = new double[] { sock.RelativeScale.X, sock.RelativeScale.Y, sock.RelativeScale.Z };
+
+                    var sr = new double[] { sLocRel[0]*bS[0], sLocRel[1]*bS[1], sLocRel[2]*bS[2] };
+                    var rv = TransformMath.MatVecMul(bR, sr);
+                    var outLoc = new double[] { bL[0]+rv[0], bL[1]+rv[1], bL[2]+rv[2] };
+                    var outRot = TransformMath.MatMul(bR, sRotRel);
+                    var outScl = new double[] { bS[0]*sSclRel[0], bS[1]*sSclRel[1], bS[2]*sSclRel[2] };
+
+                    result[socketName] = (outLoc, outRot, outScl);
+                }
+            }
+
+            ProcessSockets(mesh.Sockets);
+
+            // Also merge sockets defined on the USkeleton asset.
+            try
+            {
+                if (mesh.Skeleton != null && !mesh.Skeleton.IsNull &&
+                    mesh.Skeleton.Load<UObject>() is USkeleton skel)
+                {
+                    ProcessSockets(skel.Sockets);
+                }
+            }
+            catch { }
+
+            // AttachToName on a SkeletalMeshComponent may also refer directly to a bone
+            // (not just a named socket). Expose each bone's mesh-local transform as a
+            // fallback entry; existing socket entries take precedence.
+            for (int i = 0; i < boneCount; i++)
+            {
+                var bname = refSkel.FinalRefBoneInfo[i].Name.Text;
+                if (string.IsNullOrEmpty(bname)) continue;
+                if (result.ContainsKey(bname)) continue;
+                result[bname] = (boneLoc[i], boneRot[i], boneScl[i]);
+            }
+
+            return result.Count > 0 ? result : null;
         }
 
         private void ExportMesh(FPackageIndex? meshIdx)

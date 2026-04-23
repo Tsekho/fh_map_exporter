@@ -23,6 +23,14 @@ namespace Exporter
             "SplineMeshComponent",
         };
 
+        /// <summary>Component object names that are always skipped (e.g. "DestroyedMesh"
+        /// - a native StaticMeshComponent on vehicle BPs that is only shown when the
+        /// vehicle is wrecked; without this filter both live and destroyed hulls emit).</summary>
+        public static readonly HashSet<string> SkipComponentNames = new(System.StringComparer.OrdinalIgnoreCase)
+        {
+            "DestroyedMesh",
+        };
+
         public static string NormaliseMeshName(string meshName)
         {
             if (meshName == "Meshes__Structures__ConstructionYardCritical")
@@ -44,27 +52,7 @@ namespace Exporter
             "Engine__Content__BasicShapes__.*",
             "Meshes__Measurement__Plane",
             "FX__Mesh__.*",
-            "Meshes__SM_SkySphere",
-            "Meshes__Vehicles__BargeDestroyed",
-            "Meshes__Vehicles__CraneDestroyed",
-            "Meshes__Vehicles__Freighter02Destroyed",
-            "Meshes__Vehicles__Freighter02ShipCollision",
-            "Meshes__Vehicles__HarvesterDestroyed",
-            "Meshes__Vehicles__Headlight",
-            "Meshes__Vehicles__MotorboatDestroyed",
-            "Meshes__Vehicles__Motorboat_cull",
-            "Meshes__Vehicles__SM_ScoutVehicleBaseC",
-            "Meshes__Vehicles__SM_ScoutVehicleBaseW",
-            "Meshes__Vehicles__SM_TruckBaseW",
-            "Meshes__Vehicles__SM_TruckBaseW_Trailer",
-            "Meshes__Vehicles__SM_TruckBaseC",
-            "Meshes__Vehicles__SM_TruckBaseC_Trailer",
-            "Meshes__Shippables__ShippingContainerLargeExposed",
-            "Meshes__Vehicles__SK_Crane",
-            "Meshes__Vehicles__SK_Barge_03",
-            "Meshes__Vehicles__SK_FlatbedTruck",
-            "Meshes__Vehicles__SK_ScoutVehicleBaseW_Cabin",
-            "Meshes__Structures__SK_RailTrackSwitch"
+            "Meshes__SM_SkySphere"
         };
 
         private static readonly Regex[] _hardbanPatterns =

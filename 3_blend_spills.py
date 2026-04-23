@@ -1,25 +1,10 @@
-"""
-3_blend_spills.py
-========
-Generate a .blend file per region with a 200 m spill of rocks / glaciers /
-landscape meshes from each hexagonal neighbor. Neighbor terrain is excluded;
-only the focus region's terrain is included.
+"""Generate a per-region .blend with neighbor spill.
 
-Output goes to export/blend_spill/<Region>.blend. Top-down bakes (AO /
-heightmap / ID / water) are produced by the companion script
-4_render_spills.py.
+Neighbor terrain/water are excluded; only focus-region terrain is included.
+Output: export/blend_spill/<Region>.blend.
 
 Usage:
     python 3_blend_spills.py [RegionName] [-a]
-
-Examples:
-    python 3_blend_spills.py OarbreakerHex
-    python 3_blend_spills.py -a
-    python 3_blend_spills.py                # interactive region selection
-
-Options:
-    RegionName   Region name (e.g. OarbreakerHex); omit for interactive prompt
-    -a, --all    Process every region found in export/_json
 """
 
 import argparse
@@ -29,14 +14,14 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from utils.config import (
-    CATALOGUE_FILE, CENTRES_FILE, EXPORT_DIR, JSON_DIR, NUM_WORKERS,
+    CATEGORY_COLORS, CENTRES_FILE, EXPORT_DIR, JSON_DIR, NUM_WORKERS,
+    CATALOGUE_FILE,
 )
-from utils.helpers import build_region_with_spill
+from utils.regions import build_region_with_spill
 from utils.parallel import run_parallel_subprocesses
 
 
 def load_json_name_map() -> Dict[str, str]:
-    """Return a map from lowercase region key -> JSON filename stem."""
     if not JSON_DIR.is_dir():
         return {}
     return {p.stem.lower(): p.stem for p in JSON_DIR.glob("*.json")}
@@ -46,7 +31,6 @@ def pick_region_interactive(
     region_centers: Dict[str, List[float]],
     json_name_map: Dict[str, str],
 ) -> Optional[List[str]]:
-    """Prompt the user to select a region present in both JSON and centers."""
     keys = sorted(k for k in region_centers if k in json_name_map)
     if not keys:
         print(f"ERROR: no regions available (check {JSON_DIR} and {CENTRES_FILE})")
@@ -76,19 +60,13 @@ def pick_region_interactive(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate a region .blend with 200 m neighbor spill.",
+        description="Generate a region .blend with neighbor spill.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "region_name",
-        nargs="?",
-        help="Region name (e.g. OarbreakerHex); omit for interactive selection",
-    )
-    parser.add_argument(
-        "-a", "--all",
-        action="store_true",
-        help="Process every region found in export/_json",
-    )
+    parser.add_argument("region_name", nargs="?",
+                        help="Region name; omit for interactive selection")
+    parser.add_argument("-a", "--all", action="store_true",
+                        help="Process every region in export/_json")
     args = parser.parse_args()
 
     if not CENTRES_FILE.is_file():
@@ -103,12 +81,20 @@ def main() -> int:
     with CATALOGUE_FILE.open("r", encoding="utf-8") as f:
         catalogue: Dict[str, List[str]] = json.load(f)
 
+    dropped = [c for c in catalogue if c not in CATEGORY_COLORS]
+    if dropped:
+        print(f"[filter] skipping categories not in CATEGORY_COLORS: "
+              f"{', '.join(dropped)}")
+        catalogue = {
+            c: meshes for c, meshes in catalogue.items()
+            if c in CATEGORY_COLORS
+        }
+
     json_name_map = load_json_name_map()
     if not json_name_map:
         print(f"ERROR: no JSON files found in {JSON_DIR}")
         return 1
 
-    # Resolve region list -----------------------------------------------------
     if args.all:
         region_keys = sorted(k for k in region_centers if k in json_name_map)
         if not region_keys:
@@ -133,7 +119,6 @@ def main() -> int:
     print(f"=== Building {len(region_keys)} region spill(s) "
           f"(workers={NUM_WORKERS if parallel else 1}) ===")
 
-    # Parallel fan-out --------------------------------------------------------
     if parallel:
         def _cmd(key: str) -> List[str]:
             name = json_name_map.get(key, key)
@@ -151,11 +136,12 @@ def main() -> int:
         print(f"\n=== SUCCESS ===")
         return 0
 
-    # Serial path -------------------------------------------------------------
     errors: List[str] = []
-    for key in region_keys:
+    total = len(region_keys)
+    w = len(str(total))
+    for i, key in enumerate(region_keys, 1):
         name = json_name_map.get(key, key)
-        print(f"\n=== {name} ===")
+        print(f"\n=== [{i:>{w}}/{total}] {name} ===")
         try:
             build_region_with_spill(
                 region_key=key,

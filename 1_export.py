@@ -1,14 +1,4 @@
-"""
-1_export.py
-========
-Export Foxhole game data from the .pak file using Exporter.exe.
-
-Clears the export/ directory, runs Exporter.exe against the game .pak, then
-prints a summary of extracted symbols, groups, blueprints, meshes, and JSON.
-
-Usage:
-    python 1_export.py
-"""
+"""Run Exporter.exe against the game .pak and print a summary."""
 
 import subprocess
 import json

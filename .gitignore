@@ -5,7 +5,16 @@ obj/
 _*.py
 __*
 
-# Ignore export/ but keep the stitched PNGs in export/_final/
 /export/*
 !/export/_final/
-!/export/_layers_collection/
+!/export/_extra/
+
+utils/svg/safehouses/
+utils/svg/garrisons/
+utils/svg/runways/
+utils/svg/runways_aim/
+utils/svg/bridges_aim/
+utils/svg/tiers/
+utils/svg/drop_pads/
+utils/svg/interiors/
+utils/svg/stairs/

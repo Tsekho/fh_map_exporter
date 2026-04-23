@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-50 -50 100 100" overflow="visible">
+  <path d="m5 -84 h-10 v15 h-3 a3 3 270 0 0 -3 3 h-2 v9 h2 a3 3 270 0 0 3 3 h3 v16 a3 3 270 0 0 -3 3 v1 a3 3 270 0 0 3 3 v9 a3 3 270 0 0 -3 3 v1 a3 3 270 0 0 3 3 v30 a3 3 270 0 0 -3 3 v1 a3 3 270 0 0 3 3 v9 a3 3 270 0 0 -3 3 v1 a3 3 270 0 0 3 3 v16 h-3 a3 3 270 0 0 -3 3 h-2 v9 h2 a3 3 270 0 0 3 3 h3 v15 h10 v-15 h3 a3 3 90 0 0 3 -3 h2 v-9 h-2 a3 3 90 0 0 -3 -3 h-3 v-16 a3 3 90 0 0 3 -3 v-1 a3 3 90 0 0 -3 -3 v-9 a3 3 90 0 0 3 -3 v-1 a3 3 90 0 0 -3 -3 v-30 a3 3 90 0 0 3 -3 v-1 a3 3 90 0 0 -3 -3 v-9 a3 3 90 0 0 3 -3 v-1 a3 3 90 0 0 -3 -3 v-16 h3 a3 3 90 0 0 3 -3 h2 v-9 h-2 a3 3 90 0 0 -3 -3 h-3 z" fill="#535353" stroke="#535353" stroke-width="1.5" />
+  <path d="m5 -54 v16 h-10 v-16 z" fill="#ada9a2" opacity="0.8" />
+  <path d="m-5 54 v-16 h10 v16 z" fill="#ada9a2" opacity="0.8" />
+  <path d="m5 -31 v9 h-10 v-9 z" fill="#ada9a2" opacity="0.8" />
+  <path d="m-5 31 v-9 h10 v9 z" fill="#ada9a2" opacity="0.8" />
+  <path d="m0 0 v-92.75" stroke="#52e6a1" stroke-width="8" stroke-linecap="round" />
+  <path d="m0 0 v92.75" stroke="#52e6a1" stroke-width="8" stroke-linecap="round" />
+  <path d="m5 -15 v30 h-10 v-30 z" fill="#ada9a2" opacity="0.8" />
+</svg>

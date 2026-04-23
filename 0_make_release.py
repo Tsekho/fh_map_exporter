@@ -1,14 +1,4 @@
-"""
-0_make_release.py
-========
-Build Exporter.exe as a self-contained win-x64 single-file release binary.
-
-Runs `dotnet publish` on Exporter/Exporter.csproj and copies the result to
-the repo root as Exporter.exe.
-
-Usage:
-    python 0_make_release.py
-"""
+"""Build Exporter.exe as a self-contained win-x64 single-file binary."""
 
 import subprocess
 import sys
@@ -24,8 +14,7 @@ from utils.config import (
 
 def run(cmd: list[str], **kwargs) -> int:
     print(f"  >> {' '.join(str(c) for c in cmd)}")
-    result = subprocess.run(cmd, **kwargs)
-    return result.returncode
+    return subprocess.run(cmd, **kwargs).returncode
 
 
 def main() -> int:

@@ -11,22 +11,57 @@ stays readable.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import threading
 import time
 from typing import Callable, List, Sequence
 
+from utils.config import REPO_ROOT
+
 
 _PRINT_LOCK = threading.Lock()
 
 
+# Match any absolute path that starts with REPO_ROOT (both "\" and "/"
+# separators, case-insensitive on Windows) and rewrite it to a repo-
+# relative POSIX path so Blender's own log lines (e.g.
+# `Read blend: "C:\...\export\blend_spill\X.blend"`) don't blow the
+# column budget.
+def _make_path_shortener() -> Callable[[str], str]:
+    root = str(REPO_ROOT)
+    root_variants = {root, root.replace("\\", "/"), root.replace("/", "\\")}
+    # Sort longest-first so the most specific prefix wins.
+    alts = sorted({re.escape(v) for v in root_variants}, key=len, reverse=True)
+    pattern = re.compile("(" + "|".join(alts) + r")([\\/][^\s\"')]*)?",
+                         re.IGNORECASE)
+
+    def _sub(m: re.Match) -> str:
+        tail = m.group(2) or ""
+        tail = tail.lstrip("\\/").replace("\\", "/")
+        return tail if tail else "."
+
+    def _shorten(line: str) -> str:
+        return pattern.sub(_sub, line)
+
+    return _shorten
+
+
+_shorten_paths = _make_path_shortener()
+
+
 def _pump(label: str, proc: subprocess.Popen) -> None:
-    """Forward a child's stdout to our stdout, prefixed with ``[label] ``."""
+    """Forward a child's stdout to our stdout, prefixed with ``[label] ``.
+
+    Repo-root absolute paths in the line are rewritten to repo-relative
+    POSIX paths so Blender's native log output doesn't dump 100+ char
+    absolute paths.
+    """
     assert proc.stdout is not None
     for line in proc.stdout:
         with _PRINT_LOCK:
-            sys.stdout.write(f"[{label}] {line}")
+            sys.stdout.write(f"[{label}] {_shorten_paths(line)}")
             sys.stdout.flush()
 
 
@@ -39,8 +74,9 @@ def run_parallel_subprocesses(
     """
     Run one subprocess per item with at most ``workers`` running at once.
 
-    ``build_cmd(item)`` must return the argv list for that item's subprocess.
-    ``label_fn(item)`` produces the short prefix used on every output line.
+    Each output line is prefixed with "[i/N name] " where ``name`` is
+    ``label_fn(item)`` right-padded to the longest label so concurrent
+    workers line up in the terminal.
 
     Returns the list of items whose subprocess exited with a non-zero code.
     """
@@ -48,14 +84,28 @@ def run_parallel_subprocesses(
         workers = 1
 
     pending: List[str] = list(items)
-    active: dict = {}  # Popen -> (item, thread)
+    active: dict = {}  # Popen -> (item, thread, label)
     failed: List[str] = []
 
+    total = len(items)
+    # Precompute aligned prefixes so interleaved output lines up cleanly.
+    raw_labels = [label_fn(it) for it in items]
+    name_width = max((len(n) for n in raw_labels), default=0)
+    idx_width = len(str(total))
+
+    started = 0
+
+    def _prefix(item: str) -> str:
+        nonlocal started
+        started += 1
+        name = label_fn(item).ljust(name_width)
+        return f"{started:>{idx_width}}/{total} {name}"
+
     def _launch(item: str) -> None:
-        label = label_fn(item)
+        label = _prefix(item)
         cmd = build_cmd(item)
         with _PRINT_LOCK:
-            print(f"[{label}] launching: {' '.join(cmd)}", flush=True)
+            print(f"[{label}] launching", flush=True)
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -67,7 +117,7 @@ def run_parallel_subprocesses(
             target=_pump, args=(label, proc), daemon=True,
         )
         thread.start()
-        active[proc] = (item, thread)
+        active[proc] = (item, thread, label)
 
     while pending and len(active) < workers:
         _launch(pending.pop(0))
@@ -75,9 +125,8 @@ def run_parallel_subprocesses(
     while active:
         finished = [p for p in active if p.poll() is not None]
         for proc in finished:
-            item, thread = active.pop(proc)
+            item, thread, label = active.pop(proc)
             thread.join(timeout=5)
-            label = label_fn(item)
             rc = proc.returncode
             with _PRINT_LOCK:
                 status = "OK" if rc == 0 else f"FAILED (rc={rc})"
