@@ -13,6 +13,8 @@ Python pipeline for exporting and processing maps from [Foxhole](https://store.s
                            roads,beaches,id/<cat>,split_layers/<layer>,svg_layers/<layer>}/<Region>.png
 5_finalize_exports.py  ->  stitches bakes into world PNGs and assembles final composites
                            → export/_final/{technical,assembly,id,split_layers,svg_layers}/
+6_breaker.py           ->  interactive: break any world PNG back into per-region tiles
+                           → <input_stem>/<Region>.png
 ```
 
 ## Requirements
@@ -22,7 +24,7 @@ Python pipeline for exporting and processing maps from [Foxhole](https://store.s
 - **numpy**, **opencv-python** (steps 4 & 5), **bpy** (steps 2–4), **cairosvg** (step 4, `-svg`)
 - Blender 5
 - [.NET 10 SDK](https://dotnet.microsoft.com/download) (step 0 only)
-
+- Cairo (the easiest way to install it - [GTK for Windows Runtime Environment](https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer))
 ```bash
 pip install numpy opencv-python bpy cairosvg
 ```
@@ -129,11 +131,11 @@ Outputs (per-region PNGs):
 - `ao/`, `heightmap_landscape/`, `heightmap_water/` - grayscale bakes.
   `heightmap_landscape` passes through water; `heightmap_water` stops
   on the water surface.
-- `roads/`, `beaches/` - RGBA spline coverage (SSAA, coloured via
+- `roads/`, `beaches/` - RGBA spline coverage (SSAA, colored via
   `SPLINE_COLORS`). Beaches alpha is masked to `terrain × (not water)`.
 - `id/<category>/` - 8-bit coverage per category (`ID_SSAA`).
 - `split_layers/<layer>/` - RGBA Cycles AO per split layer; each
-  category is tinted via its colour from `SPLIT_LAYERS`.
+  category is tinted via its color from `SPLIT_LAYERS`.
 - `svg_layers/<layer>/` - cairosvg raster of `utils/svg/<cat>/<name>.svg`
   instanced via `<use>` at every JSON transform. UE cm map to SVG px as
   `x = x_cm * 1776 / 189000 + 1024`.
@@ -158,7 +160,7 @@ Output layout (under `export/_final/`):
 - `technical/heightmap_simple.png` - 8-bit from `heightmap_water`;
   shade 60 = z=0 m, 1 shade = 0.5 m.
 - `technical/contour.png` - black RGBA lines where `hm // 250`
-  increments across a 4-neighbour boundary, masked to terrain.
+  increments across a 4-neighbor boundary, masked to terrain.
 - `assembly/roads.png`, `assembly/beaches.png` - stitched from step 4.
 - `assembly/fly_alert.png` - `utils/fly_alert_pattern.png` tiled, alpha
   ramped between `FLY_ALERT_MIN_M` and `FLY_ALERT_MAX_M`, gated by
@@ -183,14 +185,34 @@ Output layout (under `export/_final/`):
 - `id/<cat>.png`, `split_layers/<layer>.png`, `svg_layers/<layer>.png`
   - verbatim stitches of the per-region bakes.
 
-These stitched PNGs are compatible with the
-[map mod generator](https://github.com/Tsekho/fh_map_mod_generator).
+**Important**: This exporter's output is intended for use with the
+[map mod generator](https://github.com/Tsekho/fh_map_mod_generator) that allows to convert composed layers into a standalone map mod via a single function call. For any other use you'll most likely want to break it apart into separate regions - see step 6.
+
+### Step 6 - Break World PNG Into Regions
+
+Interactive helper that slices any world-sized PNG back into per-region
+tiles using `utils/region_centers.json` and `utils/mask.png`. Lists
+`*.png` files in the current directory (or accepts a pasted path), then
+asks whether to downscale to 1k.
+
+```bash
+python 6_breaker.py
+```
+
+For each region, extracts a 2048x2048 crop centred on the region's
+world-pixel coordinates, multiplies `mask.png` into the alpha channel,
+then saves either:
+
+- default: **2048x1776**
+- 1k mode: **1024x888** (default map textures size)
+
+Output: `<input_stem>/<Region>.png` (created in the current directory).
 
 ## Parallel Execution
 
 Steps 2, 3, and 4 fan out to multiple subprocesses when more than one
-item is queued. Worker count is controlled by `NUM_WORKERS` in
-`utils/config.py` (default `4`). Set it to `1` for serial execution.
+item is queued. Worker count is controlled by `NUM_WORKERS` and `NUM_WORKERS_SPILLS` in
+`utils/config.py`. Set it to `1` for serial execution.
 The fan-out logic lives in `utils/parallel.py`.
 
 ## Project Structure
@@ -203,6 +225,7 @@ The fan-out logic lives in `utils/parallel.py`.
 ├── 3_blend_spills.py           # Per-region spill .blend
 ├── 4_render_spills.py          # Top-down bakes per region
 ├── 5_finalize_exports.py       # Stitches bakes + layers into world PNGs
+├── 6_breaker.py                # Breaks a world PNG back into per-region tiles
 ├── Exporter/                   # C# exporter source (.NET 10, win-x64)
 │   ├── Program.cs
 │   ├── MapExporter.cs
@@ -231,6 +254,8 @@ The fan-out logic lives in `utils/parallel.py`.
 
 ## Transform Format
 
+### Regular Objects
+
 Every placed object in the exported JSON is a 9-element array:
 
 ```text
@@ -239,3 +264,21 @@ Every placed object in the exported JSON is a 9-element array:
 
 Coordinates are UE world-space centimetres; rotations are degrees.
 `utils/blender.py` converts these to Blender metres/radians.
+
+### Splines
+
+Spline mesh components are exported as 23-element arrays containing the cubic hermite spline parameters needed to reconstruct the deformed mesh:
+
+```text
+[0..2]   world start position (x, y, z in cm)
+[3..5]   world start tangent (x, y, z in cm)
+[6..8]   world end position (x, y, z in cm)
+[9..11]  world end tangent (x, y, z in cm)
+[12]     start roll (radians)
+[13..14] start offset (x, y, component-space 2D)
+[15..16] start scale (x, y)
+[17]     end roll (radians)
+[18..19] end offset (x, y, component-space 2D)
+[20..21] end scale (x, y)
+[22]     forward axis (0=X, 1=Y, 2=Z)
+```
