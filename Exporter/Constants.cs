@@ -108,5 +108,26 @@ namespace Exporter
         /// <summary>Returns the Z offset (cm) for the given map name, or 0 if not found.</summary>
         public static double GetHeightOffset(string mapName) =>
             HeightOffsets.TryGetValue(mapName, out var v) ? v : 0.0;
+
+        /// <summary>
+        /// Per-proxy Z corrections (cm) ADDED to the LocZ read from a specific
+        /// LandscapeProxy's RootComponent.
+        /// </summary>
+        public static readonly Dictionary<string, Dictionary<string, double>> LandscapeProxyZCorrections =
+            new(System.StringComparer.OrdinalIgnoreCase)
+        {
+            ["GodCroftsHex"] = new(System.StringComparer.OrdinalIgnoreCase)
+            {
+                ["CentreIslandLandscape2"] = 380,
+            },
+        };
+
+        public static double GetProxyZCorrection(string mapName, string proxyName)
+        {
+            if (LandscapeProxyZCorrections.TryGetValue(mapName, out var map)
+                && map.TryGetValue(proxyName, out var v))
+                return v;
+            return 0.0;
+        }
     }
 }

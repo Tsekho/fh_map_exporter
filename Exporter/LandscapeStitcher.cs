@@ -69,7 +69,17 @@ namespace Exporter
                 if (obj is not ALandscapeProxy proxy) continue;
 
                 var info = BuildInfo(proxy);
-                if (info != null) infos.Add(info);
+                if (info != null)
+                {
+                    double zFix = Constants.GetProxyZCorrection(mapName, info.Name);
+                    if (zFix != 0.0)
+                    {
+                        Log.Information("  Applying per-proxy Z correction of {0} cm to '{1}' ({2} → {3}).",
+                            zFix, info.Name, info.LocZ, info.LocZ + zFix);
+                        info.LocZ += zFix;
+                    }
+                    infos.Add(info);
+                }
             }
 
             if (infos.Count == 0)
@@ -294,6 +304,7 @@ namespace Exporter
             // UE4 formula: height_cm = (raw - 32768) * LANDSCAPE_ZSCALE * scaleZ
             // Stored as: output_raw = height_cm + 32768 (32768 = zero height)
             var srcPixels = new ushort[srcW * srcH];
+            double minH = double.PositiveInfinity, maxH = double.NegativeInfinity;
             src.ProcessPixelRows(acc =>
             {
                 for (int y = 0; y < srcH; y++)
@@ -309,12 +320,19 @@ namespace Exporter
 
                         if (heightCm < -10_000.0) { srcPixels[y * srcW + x] = 0; continue; }
 
+                        if (heightCm < minH) minH = heightCm;
+                        if (heightCm > maxH) maxH = heightCm;
+
                         double encoded  = heightCm + 32768.0;
                         srcPixels[y * srcW + x] =
                             (ushort)Math.Clamp((int)Math.Round(encoded), 0, 65535);
                     }
                 }
             });
+
+            if (!double.IsInfinity(minH))
+                Log.Information("    '{0}' height range: [{1:F0}, {2:F0}] cm (LocZ={3:F0})",
+                    info.Name, minH, maxH, info.LocZ);
 
             GetOutputBounds(info, srcW, srcH,
                 HmPixelsPerCm, HmOutputCenter, HmOutputSize,
