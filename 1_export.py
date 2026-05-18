@@ -4,7 +4,14 @@ import subprocess
 import json
 import sys
 
-from utils.config import EXPORT_DIR, EXPORTER_EXE, FOXHOLE_PAK, JSON_DIR, MESHES_DIR
+from utils.config import (
+    CATALOGUE_FILE,
+    EXPORT_DIR,
+    EXPORTER_EXE,
+    FOXHOLE_PAK,
+    JSON_DIR,
+    MESHES_DIR,
+)
 
 
 def main() -> int:
@@ -36,6 +43,39 @@ def main() -> int:
     print(f"  meshes     : {n_pskx:>6} .pskx files in {MESHES_DIR}")
     print(f"  meshes     : {n_psk:>6} .psk  files in {MESHES_DIR}")
     print(f"  JSON       : {json_path}  ({json_path.stat().st_size / 1024:.0f} KB)")
+
+    # Compare catalogue.json vs exported meshes
+    if CATALOGUE_FILE.exists() and MESHES_DIR.exists():
+        catalogue = json.loads(CATALOGUE_FILE.read_text(encoding="utf-8"))
+        catalogue_entries = set()
+        for entries in catalogue.values():
+            catalogue_entries.update(entries)
+
+        exported = {
+            p.stem
+            for p in MESHES_DIR.rglob("*")
+            if p.suffix.lower() in (".pskx", ".psk")
+        }
+
+        missing = sorted(catalogue_entries - exported)
+        disappeared = sorted(exported - catalogue_entries)
+
+        print()
+        print("=== CATALOGUE DIFF ===")
+        print(f"  catalogue entries : {len(catalogue_entries)}")
+        print(f"  exported meshes   : {len(exported)}")
+        print(f"  in catalogue, not exported: {len(missing)}")
+        for name in missing:
+            print(f"    - {name}")
+        print(f"  exported, not in catalogue: {len(disappeared)}")
+        for name in disappeared:
+            print(f"    + {name}")
+    else:
+        if not CATALOGUE_FILE.exists():
+            print(f"WARN: catalogue not found: {CATALOGUE_FILE}")
+        if not MESHES_DIR.exists():
+            print(f"WARN: meshes dir not found: {MESHES_DIR}")
+
     return 0
 
 

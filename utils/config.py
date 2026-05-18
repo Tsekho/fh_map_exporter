@@ -118,6 +118,8 @@ AO_SLOPE_POWER_WEAK   = 5.0
 AO_SLOPE_C_WEAK       = 0.6
 AO_SLOPE_POWER_STRONG = 5.0
 AO_SLOPE_C_STRONG     = 0.75
+AO_SLOPE_POWER_SL     = 5.0
+AO_SLOPE_C_SL         = 0.6
 
 # After the AO bake, pixels with shade >= AO_NEAR_WHITE_CUTOFF get
 # clipped to 255 so near-white noise doesn't read as faint shading.
@@ -186,15 +188,15 @@ SPLINE_LAYER_TERRAIN_DROP = 4
 # controlled independently by TERRAIN_WHITELIST above. A category can
 # therefore appear in both the whitelist and a split layer if desired.
 SPLIT_LAYERS: Dict[str, Dict[str, str]] = {
-    "houses":    {"houses":          "#2F2F2F"},
-    "ghouses":   {"ghouses":         "#949494"},
-    "industry":  {"industry":        "#404F3D"},
+    "houses":    {"houses":          "#575657"},
+    "ghouses":   {"ghouses":         "#A6AEBE"},
+    "industry":  {"industry":        "#789586"},
     "obstacles": {"obstacles_large": "#2F2F2F",
                   "obstacles_small": "#2F2F2F",
                   "walls_large":     "#2F2F2F",
                   "walls_small":     "#2F2F2F",
                   "sidewalks":       "#78787F",
-                  "vehicles":        "#2F2F2F"}
+                  "vehicles":        "#7E78A7"}
 }
 # ignored foliage_collision, foliage_invis, foliage_no_collision
 # roofs_ghouses, roofs_misc, ignore
@@ -277,10 +279,11 @@ SPLINE_CATEGORIES: Dict[str, list] = {
     "t3_road": [
         "Meshes__Environment__Roads__RoadT3Gravel01",
         "Meshes__Environment__Roads__RoadT3Gravel01Snow",
-        "Meshes__Environment__Roads__RoadGreatMarch01"
+        "Meshes__Environment__Roads__RoadGreatMarch01",
+        "Meshes__Environment__Roads__RoadGreatMarch01Snow",
     ],
     "beach": [
-        "Engine__Content__EditorLandscapeResources__SplineEditorMesh"
+        "Engine__Content__EditorLandscapeResources__SplineEditorMesh",
     ],
 }
 
@@ -288,9 +291,9 @@ SPLINE_CATEGORIES: Dict[str, list] = {
 # 4_render_spills.py. Entries without a color here fall back to the
 # generic 'splines' color.
 SPLINE_COLORS: Dict[str, str] = {
-    "t1_road":                 "#9DB8B1",
-    "t2_road":                 "#AF8D6F",
-    "t3_road":                 "#AA706D",
+    "t1_road":                 "#BEC1C0",
+    "t2_road":                 "#B89B83",
+    "t3_road":                 "#B48780",
     "beach":                   "#B6A177",
 }
 
@@ -337,7 +340,7 @@ ID_RECOLOR: Dict[str, str] = {
     "water":                   "#DFE8ED",
     "terrain":                 "#9495A1",
     "rocks":                   "#727480",
-    "glaciers":                "#FFFFFF",
+    "glaciers":                "#E0E0E0",
     "deep_water":              "#9B9B9B",
     "landscape_meshes_brown":  "#90746B",
     "landscape_meshes_gray":   "#5A5A5A",

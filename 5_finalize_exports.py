@@ -2,7 +2,7 @@
 
 Writes to ``export/_final/``: ``technical/`` (ao, heightmap_simple, contour),
 ``assembly/`` (base_layer, beaches, roads, fly_alert, dive_alert, contours,
-rdz, ranges, bridge_aim), and verbatim ``id/``, ``split_layers/``,
+rdz, ranges, bridges_aim), and verbatim ``id/``, ``split_layers/``,
 ``svg_layers/``.
 
 Usage:
@@ -54,8 +54,8 @@ from utils.config import (
 TECHNICAL_DIR = "technical"
 ASSEMBLY_DIR = "assembly"
 
-# Erosion radius (pixels) applied to the water mask when gating bridge_aim.
-BRIDGE_AIM_WATER_ERODE_PX = 25
+# Erosion radius (pixels) applied to the water mask when gating bridges_aim.
+BRIDGES_AIM_WATER_ERODE_PX = 25
 
 # Gaussian blur applied to the contour overlay before it lands in assembly/.
 CONTOURS_BLUR_KSIZE = 3
@@ -758,19 +758,19 @@ def build_ranges(
     LOG.saved(out_path)
 
 
-def build_bridge_aim(
+def build_bridges_aim(
     water_cov: np.ndarray | None,
     out_path: Path,
 ) -> None:
     """svg_layers/bridges_aim gated by (water eroded by 25 px)."""
     src = _load_svg_layer("bridges_aim")
     if src is None:
-        print("  [WARN] svg_layers/bridges_aim.png missing; skipping bridge_aim")
+        print("  [WARN] svg_layers/bridges_aim.png missing; skipping bridges_aim")
         return
     if water_cov is None:
-        print("  [WARN] water coverage unavailable; skipping bridge_aim")
+        print("  [WARN] water coverage unavailable; skipping bridges_aim")
         return
-    k = 2 * BRIDGE_AIM_WATER_ERODE_PX + 1
+    k = 2 * BRIDGES_AIM_WATER_ERODE_PX + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     eroded = cv2.erode(water_cov, kernel)
     gate = eroded.astype(np.float32) / 255.0
@@ -838,7 +838,7 @@ def main() -> int:
     if HM_WATER_DIR.is_dir():      est += 1  # heightmap_simple
     if HM_LANDSCAPE_DIR.is_dir() and HM_WATER_DIR.is_dir():
         est += 1  # dive_alert
-    est += 4  # base_layer, rdz, ranges, bridge_aim (may skip)
+    est += 4  # base_layer, rdz, ranges, bridges_aim (may skip)
     LOG.set_total(est)
 
     world_alpha = _compute_world_alpha(centres, mask, height, width)
@@ -1029,9 +1029,9 @@ def main() -> int:
         FINAL_DIR / ASSEMBLY_DIR / "ranges.png",
     )
 
-    # -- assembly/bridge_aim.png --
-    build_bridge_aim(
-        water_cov, FINAL_DIR / ASSEMBLY_DIR / "bridge_aim.png",
+    # -- assembly/bridges_aim.png --
+    build_bridges_aim(
+        water_cov, FINAL_DIR / ASSEMBLY_DIR / "bridges_aim.png",
     )
 
     print(f"\n=== SUCCESS (in {time.time() - t0:.2f}s) ===")
