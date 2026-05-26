@@ -17,6 +17,7 @@ from utils.config import (
     AO_SLOPE_POWER_STRONG,
     AO_SLOPE_POWER_WEAK,
     AO_SLOPE_POWER_SL,
+    MIN_SPLIT_LAYER_VALUE,
     SPLIT_LAYER_EDGE_SHADER_POWER,
     SPLIT_LAYER_EDGE_SHADER_RADIUS_PX,
     SPLIT_LAYER_EDGE_SHADER_STRENGTH,
@@ -1256,6 +1257,20 @@ def render_split_layers_ao(
     shade_out, edge_tex_node = _add_split_layer_edge_darken(
         nt, shade.outputs["Value"],
     )
+
+    # Shader-level minimum on the final shade scalar. This caps how
+    # dark AO / slope / edge darkening can drive the tint (so e.g.
+    # tightly-walled ghouse interiors never render near-black). The
+    # cap is applied to the 0..1 multiplier BEFORE the tint, so the
+    # output color is clamped to `min_v * tint` per pixel while all
+    # anti-aliasing and gradients above the floor are preserved.
+    min_v = max(0.0, min(1.0, float(MIN_SPLIT_LAYER_VALUE) / 255.0))
+    if min_v > 0.0:
+        shade_min = nt.nodes.new("ShaderNodeMath")
+        shade_min.operation = 'MAXIMUM'
+        shade_min.inputs[1].default_value = min_v
+        nt.links.new(shade_out, shade_min.inputs[0])
+        shade_out = shade_min.outputs["Value"]
 
     tint = nt.nodes.new("ShaderNodeObjectInfo")
     mix = nt.nodes.new("ShaderNodeVectorMath")

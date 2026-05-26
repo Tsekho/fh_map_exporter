@@ -34,7 +34,7 @@ def short_path(p) -> str:
 
 UTILS_DIR           = REPO_ROOT / "utils"
 CENTRES_FILE        = UTILS_DIR / "region_centers.json"
-CATALOGUE_FILE = UTILS_DIR / "catalogue.json"
+CATALOGUE_FILE      = UTILS_DIR / "catalogue.json"
 MASK_FILE           = UTILS_DIR / "mask.png"
 FLY_ALERT_PATTERN_FILE = UTILS_DIR / "fly_alert_pattern.png"
 RDZ_PATTERN_FILE    = UTILS_DIR / "rdz_pattern.png"
@@ -188,13 +188,13 @@ SPLINE_LAYER_TERRAIN_DROP = 4
 # controlled independently by TERRAIN_WHITELIST above. A category can
 # therefore appear in both the whitelist and a split layer if desired.
 SPLIT_LAYERS: Dict[str, Dict[str, str]] = {
-    "houses":    {"houses":          "#575657"},
+    "houses":    {"houses":          "#232323"},
     "ghouses":   {"ghouses":         "#A6AEBE"},
-    "industry":  {"industry":        "#789586"},
-    "obstacles": {"obstacles_large": "#2F2F2F",
-                  "obstacles_small": "#2F2F2F",
-                  "walls_large":     "#2F2F2F",
-                  "walls_small":     "#2F2F2F",
+    "industry":  {"industry":        "#30533A"},
+    "obstacles": {"obstacles_large": "#232323",
+                  "obstacles_small": "#232323",
+                  "walls_large":     "#232323",
+                  "walls_small":     "#232323",
                   "sidewalks":       "#78787F",
                   "vehicles":        "#7E78A7"}
 }
@@ -222,6 +222,11 @@ SPLIT_LAYERS: Dict[str, Dict[str, str]] = {
 SPLIT_LAYER_EDGE_SHADER_RADIUS_PX: float = 3.0
 SPLIT_LAYER_EDGE_SHADER_STRENGTH: float = 0.9
 SPLIT_LAYER_EDGE_SHADER_POWER: float = 1.3
+
+# Minimum HSV value (brightness) for split-layer renders. Any visible pixel
+# (alpha > 0) whose V channel is below this threshold is lifted to this value,
+# preventing over-dark outputs while leaving transparent pixels untouched.
+MIN_SPLIT_LAYER_VALUE: int = 100
 
 # ------------------------------------------------------------------------------
 #  Renders

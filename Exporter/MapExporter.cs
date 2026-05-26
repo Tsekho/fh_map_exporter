@@ -1201,7 +1201,12 @@ namespace Exporter
             foreach (var (k, vs) in dict)
             {
                 var arr = new JArray();
-                foreach (var e in vs) arr.Add(e);
+                var seen = new HashSet<string>();
+                foreach (var e in vs)
+                {
+                    var key = e.ToString(Newtonsoft.Json.Formatting.None);
+                    if (seen.Add(key)) arr.Add(e);
+                }
                 obj[k] = arr;
             }
             return obj;

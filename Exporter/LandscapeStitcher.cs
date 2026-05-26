@@ -97,6 +97,21 @@ namespace Exporter
 
             Log.Information("Unique layers: {0}", string.Join(", ", allPhysNames));
 
+            // Catalogue any pre-existing layer PNGs for this region so we can
+            // delete the ones that don't get overwritten by the current run.
+            // _meshes/, _heightmap/, _json/ are intentionally left alone.
+            var preexistingLayerPngs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string layersRoot = Path.Combine(exportFolder, "_layers");
+            if (Directory.Exists(layersRoot))
+            {
+                foreach (var sub in Directory.EnumerateDirectories(layersRoot))
+                {
+                    string p = Path.Combine(sub, mapName + ".png");
+                    if (File.Exists(p)) preexistingLayerPngs.Add(p);
+                }
+            }
+            var writtenLayerPngs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             double zOffsetCm = Constants.GetHeightOffset(mapName);
             if (zOffsetCm != 0.0)
                 Log.Information("Applying Z offset of {0} cm to '{1}'.", zOffsetCm, mapName);
@@ -192,8 +207,37 @@ namespace Exporter
                     string wPath = Path.Combine(layerDir, mapName + ".png");
                     using var enc = bm.Encode(SKEncodedImageFormat.Png, 100);
                     File.WriteAllBytes(wPath, enc.ToArray());
+                    writtenLayerPngs.Add(wPath);
                     Log.Information("  → {0}", wPath);
                 }
+
+                // Delete survivors: layer PNGs from previous runs of this region
+                // that no longer correspond to a layer present in the current run.
+                int deleted = 0;
+                foreach (var stale in preexistingLayerPngs)
+                {
+                    if (writtenLayerPngs.Contains(stale)) continue;
+                    try
+                    {
+                        File.Delete(stale);
+                        deleted++;
+                        Log.Information("  ✗ {0} (stale, removed)", stale);
+
+                        // Tidy up: if the layer dir is now empty, drop it too.
+                        string? dir = Path.GetDirectoryName(stale);
+                        if (dir != null && Directory.Exists(dir) &&
+                            !Directory.EnumerateFileSystemEntries(dir).Any())
+                        {
+                            Directory.Delete(dir);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning("  Failed to delete stale '{0}': {1}", stale, ex.Message);
+                    }
+                }
+                if (deleted > 0)
+                    Log.Information("Removed {0} stale layer file(s) for '{1}'.", deleted, mapName);
 
                 Log.Information("Landscape stitching complete ({0} layer(s)).", allPhysNames.Count);
             }

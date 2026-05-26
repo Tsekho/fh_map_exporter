@@ -453,6 +453,33 @@ def render_one(
     if do_roads:
         if not _run_spline_layer(ROADS_DIR, ROADS_CATS, "roads"):
             ok = False
+        else:
+            # Soften crossroads (T1/T2/T3 transitions) with a 3x3 blur on
+            # the RGB channels only. To prevent black bleeding from
+            # transparent pixels, do an alpha-weighted (premultiplied)
+            # blur: blur premultiplied RGB and alpha separately, then
+            # unpremultiply. The on-disk alpha channel is restored
+            # unchanged so the layer's silhouette doesn't widen.
+            roads_path = ROADS_DIR / f"{region_name}.png"
+            roads_img = cv2.imread(str(roads_path), cv2.IMREAD_UNCHANGED)
+            if (roads_img is None or roads_img.ndim != 3
+                    or roads_img.shape[2] != 4):
+                print("  [WARN] roads blur skipped "
+                      "(unreadable or non-RGBA output)")
+            else:
+                bgr = roads_img[..., :3].astype(np.float32)
+                a = roads_img[..., 3].astype(np.float32) / 255.0
+                a3 = a[..., None]
+                premul = bgr * a3
+                premul_b = cv2.blur(premul, (3, 3))
+                a_b = cv2.blur(a, (3, 3))
+                denom = np.maximum(a_b, 1e-6)[..., None]
+                new_bgr = np.clip(premul_b / denom, 0, 255).astype(np.uint8)
+                visible = roads_img[..., 3] > 0
+                roads_img[..., :3][visible] = new_bgr[visible]
+                cv2.imwrite(str(roads_path), roads_img)
+                print("  [roads] 3x3 alpha-weighted RGB blur applied "
+                      "(alpha preserved)")
 
     if do_beaches:
         if not _run_spline_layer(BEACHES_DIR, BEACHES_CATS, "beaches",
