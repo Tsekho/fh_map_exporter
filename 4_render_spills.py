@@ -24,6 +24,7 @@ from utils.config import (
     AO_DIR,
     BEACHES_CATS,
     BEACHES_DIR,
+    BRIDGES_AIM_WATER_THRESH,
     CATEGORY_COLORS,
     HM_LANDSCAPE_DIR,
     HM_WATER_DIR,
@@ -55,7 +56,27 @@ from utils.bake import (
     render_split_layers_ao,
 )
 from utils.parallel import run_parallel_subprocesses
-from utils.svg_render import render_svg_layers
+from utils.svg_render import render_bridges_aim_layer, render_svg_layers
+
+
+def _load_region_water_dist(region_name: str) -> Optional[np.ndarray]:
+    """Distance-to-shore field (float32, 0 on non-water) from the per-region
+    water ID coverage PNG, or None when it's not on disk yet.
+
+    A pixel counts as water when its coverage is at least
+    BRIDGES_AIM_WATER_THRESH. This deliberately uses only the water mask:
+    over a river the terrain coverage is zero, but the water bake records
+    bridge decks as non-water (they occlude the surface), so aim lines stop
+    before crossing another bridge. The distance transform lets the aim
+    tracer steer toward the more open side of the channel."""
+    water_path = ID_DIR / "water" / f"{region_name}.png"
+    if not water_path.is_file():
+        return None
+    wc = cv2.imread(str(water_path), cv2.IMREAD_GRAYSCALE)
+    if wc is None:
+        return None
+    water = (wc >= BRIDGES_AIM_WATER_THRESH).astype(np.uint8) * 255
+    return cv2.distanceTransform(water, cv2.DIST_L2, 3)
 
 
 def _collect_focus_terrain_objects(region_name: str) -> list:
@@ -565,6 +586,21 @@ def render_one(
             except Exception as exc:
                 print(f"  [WARN] split layers bake failed: {exc}")
                 ok = False
+
+    if do_svg:
+        # bridges_aim is rendered procedurally here (not by render_svg_layers)
+        # so it can snap nearby bridges into curves and truncate straight
+        # aim lines at the shoreline using this region's land mask.
+        water_dist = _load_region_water_dist(region_name)
+        if water_dist is None:
+            print("  [bridges_aim] no water ID PNG; "
+                  "aim lines drawn at full length (no steering/cut)")
+        try:
+            if not render_bridges_aim_layer(region_name, water_dist):
+                ok = False
+        except Exception as exc:
+            print(f"  [WARN] bridges_aim render failed: {exc}")
+            ok = False
 
     return ok
 

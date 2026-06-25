@@ -355,7 +355,11 @@
     "Meshes__Structures__RelicBase03AI",
     "Meshes__Structures__RelicBase04",
     "Meshes__Structures__RelicBunkerShootSpotAI",
+    "Meshes__Structures__SK_AAGunAI",
     "Meshes__Structures__SK_CoastalGun",
+    "Meshes__Structures__SK_CoastalGunC",
+    "Meshes__Structures__NorthernTownAIEmplacementBase",
+    "Meshes__Structures__SouthernTownAIEmplacementBase",
     "Meshes__Structures__TownHallPostOffice_Blockin",
     "Meshes__Structures__TownHallSchool_Blockin",
     "Meshes__Structures__TownHall_Blockin"
@@ -578,6 +582,7 @@
     "Meshes__Environment__Props__ShippingContainerLargeTop",
     "Meshes__Environment__Props__ShippingContainerOpen02",
     "Meshes__Environment__Props__ShippingContainerSmall",
+    "Meshes__Environment__Props__ShipyardScaffold01",
     "Meshes__Environment__Props__ShipyardScaffold03",
     "Meshes__Environment__Props__ShipyardScaffold05",
     "Meshes__Environment__Props__Silo",
@@ -918,8 +923,9 @@
     "Meshes__Environment__Foliage__TreeTrunk03"
   ],
   "foliage_invis": [
-    "Meshes__Environment__Foliage__NorthShrub02",
+    "Meshes__Environment__Foliage__Bush05",
     "Meshes__Environment__Foliage__TallGrass",
+    "Meshes__Environment__Foliage__NorthShrub02",
     "Meshes__Environment__Foliage__TallGrassWinter_A"
   ],
   "foliage_no_collision": [
@@ -929,7 +935,6 @@
     "Meshes__Environment__Foliage__Bush02",
     "Meshes__Environment__Foliage__Bush03",
     "Meshes__Environment__Foliage__Bush04",
-    "Meshes__Environment__Foliage__Bush05",
     "Meshes__Environment__Foliage__Bush05Dead",
     "Meshes__Environment__Foliage__Bush05DeadSnow",
     "Meshes__Environment__Foliage__CatTail01",
@@ -1838,6 +1843,7 @@
     "Meshes__Weapons__SubMachinegunPickup",
     "Meshes__Weapons__Windsock",
     "Meshes__Weapons__binoculars",
-    "Meshes__Shippables__ShippingContainerLargeExposed"
+    "Meshes__Shippables__ShippingContainerLargeExposed",
+    "Meshes__Structures__AAspoteLight"
   ]
 }

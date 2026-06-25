@@ -1,7 +1,7 @@
 # Foxhole Map Exporter
 
 Python pipeline for exporting and processing maps from [Foxhole](https://store.steampowered.com/app/505460/Foxhole/).
-Updated for U64.
+Updated for U65 devbranch phase 1.
 
 ## Pipeline
 
@@ -180,9 +180,8 @@ Output layout (under `export/_final/`):
   `svg_layers/rdz_grace`.
 - `assembly/ranges.png` - alpha-over of range svg_layers:
   `ranges_tap × ground`, `ranges_intel`, `ranges_ai × ground`,
-  `ranges_mh`, `ranges_cg × water`.
-- `assembly/bridges_aim.png` - `svg_layers/bridges_aim` gated by water
-  coverage eroded by 25 px.
+  `ranges_mh`, `ranges_cg × water`, `ranges_aag`.
+- `svg_layers/bridges_aim.png` - bridge aligning lines, built procedurally in `4_render_spills.py`.
 - `id/<cat>.png`, `split_layers/<layer>.png`, `svg_layers/<layer>.png`
   - verbatim stitches of the per-region bakes.
 

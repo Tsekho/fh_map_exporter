@@ -296,8 +296,8 @@ SPLINE_CATEGORIES: Dict[str, list] = {
 # 4_render_spills.py. Entries without a color here fall back to the
 # generic 'splines' color.
 SPLINE_COLORS: Dict[str, str] = {
-    "t1_road":                 "#BEC1C0",
-    "t2_road":                 "#B89B83",
+    "t1_road":                 "#A2B4C1",
+    "t2_road":                 "#C1AD83",
     "t3_road":                 "#B48780",
     "beach":                   "#B6A177",
 }
@@ -376,20 +376,125 @@ ID_RECOLOR: Dict[str, str] = {
 # x_px = x_cm * 1776 / 189000 + 1024 (same for y); scale_x/scale_y/yaw
 # are applied as-is to the <use> transform.
 SVG_LAYERS: Dict[str, list] = {
-    "bridges":      ["bridges"],
-    "ranges_ai":    ["ranges_ai"],
-    "ranges_cg":    ["ranges_cg"],
-    "ranges_intel": ["ranges_intel"],
-    "ranges_mh":    ["ranges_mh"],
-    "ranges_tap":   ["ranges_tap"],
-    "wells":        ["wells"],
-    "foliage":      ["foliage_low", "foliage_medium", "foliage_tall"],
-    "rdz_grace":    ["rdz_grace"],
-    "highlights":   ["stairs", "interiors"],
-    "bridges_aim":  ["bridges_aim"],
-    "drop_pads":    ["drop_pads"],
-    "urban":        ["tiers", "safehouses"],
-    "runways":      ["runways"],
-    "runways_aim":  ["runways_aim"],
-    "garrisons":    ["garrisons"],
+    "bridges":       ["bridges"],
+    "ranges_ai":     ["ranges_ai"],
+    "ranges_cg":     ["ranges_cg"],
+    "ranges_aag":    ["ranges_aag"],
+    "ranges_intel":  ["ranges_intel"],
+    "ranges_mh":     ["ranges_mh"],
+    "ranges_tap":    ["ranges_tap"],
+    "wells":         ["wells"],
+    "foliage":       ["foliage_low", "foliage_medium", "foliage_tall"],
+    "foliage_invis": ["foliage_invis"],
+    "rdz_grace":     ["rdz_grace"],
+    "highlights":    ["stairs", "interiors"],
+    # bridges_aim is rendered procedurally (utils.svg_render
+    # .render_bridges_aim_layer), not by stamping symbols; the category list
+    # is unused. The entry is kept so 5_finalize_exports.py still stitches
+    # the per-region tiles into FINAL/svg_layers/bridges_aim.png.
+    "bridges_aim":   [],
+    "drop_pads":     ["drop_pads"],
+    "urban":         ["tiers", "safehouses"],
+    "runways":       ["runways"],
+    "runways_aim":   ["runways_aim"],
+    "garrisons":     ["garrisons"],
 }
+
+# ------------------------------------------------------------------------------
+#  Bridge aim lines (procedural; utils/svg_render.render_bridges_aim_layer)
+# ------------------------------------------------------------------------------
+#
+# The "bridges_aim" layer is special-cased: instead of stamping the static
+# utils/svg/bridges_aim/*.svg symbols, 4_render_spills.py computes the aim
+# lines per region. Every bridge gets two sockets emanating from its centre
+# along the passage axis (the bridge's local +x / -x). Each socket either:
+#   * snaps to a facing socket on a nearby bridge, forming a smooth curve
+#     that links the two crossings (so the line never crosses another
+#     bridge), or
+#   * extends straight outward and is truncated where it meets land, which
+#     replaces the old water-erosion gate in 5_finalize_exports.py.
+#
+# All values are in tile pixels (1 px == PIXEL_SIZE_M metres).
+
+# Blueprint class names (as they appear in export/_json/<region>.json) that
+# are treated as bridges. Each placement's "_self" transform spawns one aim
+# line pair. This replaces the old utils/svg/bridges_aim/*.svg registry.
+BRIDGES_AIM_BLUEPRINTS = [
+    "BPDrawbridgeA_C",
+    "BPDrawbridgeB_C",
+    "BPDrawbridgeC_C",
+    "BPTrainBridgeA_C",
+    "BPTrainBridgeC_C",
+]
+
+# Half-length of each aim line, measured from the bridge centre (matches the
+# 100-unit reach of the legacy utils/svg/bridges_aim/*.svg lines).
+BRIDGES_AIM_LENGTH_PX = 90.0
+# Gap around the bridge centre where no line is drawn (legacy 5-unit gap).
+BRIDGES_AIM_GAP_PX = 10.0
+# Stroke width / colour of the rasterised aim lines.
+BRIDGES_AIM_STROKE_PX = 1.0
+BRIDGES_AIM_COLOR = "#B83535"
+
+# Snapping: two sockets on *different* bridges snap together when the two
+# bridge centres are within this distance AND the sockets face one another
+# (each points roughly toward the other bridge). The closest eligible pair
+# is matched first (greedy).
+BRIDGES_AIM_SNAP_DIST_PX = 200.0
+# Minimum dot(socket_dir, unit_vector_to_other_bridge) for a pair to count
+# as "facing" (1.0 = perfectly head-on, 0.5 ~= within 60 degrees).
+BRIDGES_AIM_FACE_MIN_DOT = 0.7
+
+# Both unpaired (outward) sockets and snapped pairs are routed through the
+# NAVIGABLE water mask: the water coverage eroded by MIN_CLEARANCE_PX, so
+# every cell of the route sits at least that far from any shore (the ship is
+# modelled as a ball of that radius rolling down the channel). Navigability
+# is read from the export/id/water coverage field (water when coverage >=
+# BRIDGES_AIM_WATER_THRESH); the bridge deck reads as non-water and so acts
+# as a wall -- routes never cross a bridge, and the two sockets of one bridge
+# stay on opposite banks. The shortest grid route is then string-pulled into a
+# taut polyline (it goes straight as far as the channel allows and only turns
+# where an obstacle forces it) and rounded with a centripetal spline.
+#
+# Clearance guarantee: every control point keeps MIN_CLEARANCE_PX from shore,
+# and the spline between them is sampled and repaired (by subdividing) until
+# it, too, stays clear -- EXCEPT across spans shorter than MIN_CTRL_SPACING_PX,
+# where smoothness wins over clearance (the curve is left alone rather than
+# studded with control points every few pixels).
+#
+#   WATER_THRESH         coverage [0..255] at/above which a pixel is water
+#   MIN_CLEARANCE_PX     erosion radius / min distance-to-shore (px) kept by
+#                        every control point and the curve spanning them
+#   SNAP_TO_WATER_PX     max radius used to pull a bridge gap onto navigable
+#                        water before routing (the gap sits on the deck)
+#   CENTER_BIAS          OFF (0) by default. A small cost penalty for routing
+#                        close to shore, nudging the line toward deeper water.
+#                        Keep it low: large values make a long detour through
+#                        open water cheaper than the direct channel, which
+#                        produces wild U-shapes, and chase the river's medial
+#                        axis, which makes the line squiggle. Taut routing
+#                        (string-pulling) already keeps the line clear, so
+#                        this is only a gentle optional nudge.
+#   CHANNEL_PREF_PX      distance-to-shore (px) at/above which water is "deep
+#                        enough"; no centring penalty is applied past it.
+#   MIN_CTRL_SPACING_PX  control points closer than this are never split
+#                        further to chase clearance (see exception above)
+#   CURVE_CHECK_STEP_PX  spacing of samples used when testing curve clearance
+#   REFINE_PASSES        max subdivision passes enforcing curve clearance
+#   PAIR_MAX_DETOUR      a snapped pair's water route is accepted only when its
+#                        length is at most this multiple of the straight gap-
+#                        to-gap distance. When two close, slightly misaligned
+#                        bridges have their direct channel pinched shut by the
+#                        erosion, A* would otherwise loop the long way around
+#                        the far end of the other bridge's deck -- the U-shape
+#                        that crosses back over it. Past this ratio the route
+#                        is rejected in favour of a short, direct connector.
+BRIDGES_AIM_WATER_THRESH = 200
+BRIDGES_AIM_MIN_CLEARANCE_PX = 10.0
+BRIDGES_AIM_SNAP_TO_WATER_PX = 30.0
+BRIDGES_AIM_CENTER_BIAS = 3.0
+BRIDGES_AIM_CHANNEL_PREF_PX = 30.0
+BRIDGES_AIM_MIN_CTRL_SPACING_PX = 9.0
+BRIDGES_AIM_CURVE_CHECK_STEP_PX = 1.5
+BRIDGES_AIM_REFINE_PASSES = 24
+BRIDGES_AIM_PAIR_MAX_DETOUR = 1.6

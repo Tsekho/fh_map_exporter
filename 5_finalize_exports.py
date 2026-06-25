@@ -54,9 +54,6 @@ from utils.config import (
 TECHNICAL_DIR = "technical"
 ASSEMBLY_DIR = "assembly"
 
-# Erosion radius (pixels) applied to the water mask when gating bridges_aim.
-BRIDGES_AIM_WATER_ERODE_PX = 25
-
 # Gaussian blur applied to the contour overlay before it lands in assembly/.
 CONTOURS_BLUR_KSIZE = 3
 
@@ -732,13 +729,14 @@ def build_ranges(
     water01: np.ndarray,
     out_path: Path,
 ) -> None:
-    """svg_layers: tap*ground + intel + ai*ground + mh + cg*water, alpha-over."""
+    """svg_layers: tap*ground + intel + ai*ground + mh + cg*water + aag, alpha-over."""
     layers_gates = [
         ("ranges_tap",   ground01),
         ("ranges_intel", None),
         ("ranges_ai",    ground01),
         ("ranges_mh",    None),
         ("ranges_cg",    water01),
+        ("ranges_aag",   None),
     ]
     result = np.zeros((height, width, 4), dtype=np.uint8)
     any_hit = False
@@ -755,27 +753,6 @@ def build_ranges(
         print("  [WARN] no range svg_layers available; skipping ranges")
         return
     _write_rgba(result, out_path)
-    LOG.saved(out_path)
-
-
-def build_bridges_aim(
-    water_cov: np.ndarray | None,
-    out_path: Path,
-) -> None:
-    """svg_layers/bridges_aim gated by (water eroded by 25 px)."""
-    src = _load_svg_layer("bridges_aim")
-    if src is None:
-        print("  [WARN] svg_layers/bridges_aim.png missing; skipping bridges_aim")
-        return
-    if water_cov is None:
-        print("  [WARN] water coverage unavailable; skipping bridges_aim")
-        return
-    k = 2 * BRIDGES_AIM_WATER_ERODE_PX + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    eroded = cv2.erode(water_cov, kernel)
-    gate = eroded.astype(np.float32) / 255.0
-    out = _mul_alpha(src, gate)
-    _write_rgba(out, out_path)
     LOG.saved(out_path)
 
 
@@ -1027,11 +1004,6 @@ def main() -> int:
     build_ranges(
         height, width, ground01, water01,
         FINAL_DIR / ASSEMBLY_DIR / "ranges.png",
-    )
-
-    # -- assembly/bridges_aim.png --
-    build_bridges_aim(
-        water_cov, FINAL_DIR / ASSEMBLY_DIR / "bridges_aim.png",
     )
 
     print(f"\n=== SUCCESS (in {time.time() - t0:.2f}s) ===")
