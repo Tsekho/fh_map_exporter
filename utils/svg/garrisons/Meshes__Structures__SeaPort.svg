@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="-50 -50 100 100" overflow="visible">
   <path d="M7.1 -6v-3h-.4v3z" fill="#FF0000" stroke="#FF0000" stroke-width="1" />
+  <path d="M7.1 -6v-3h-.4v3z" fill="#FF0000" stroke="#FF0000" stroke-width="1" />
   <path d="M-6.7 -6v-3h-.4v3z" fill="#FF0000" stroke="#FF0000" stroke-width="1" />
+  <path d="M-6.7 -6v-3h-.4v3z" fill="#FF0000" stroke="#FF0000" stroke-width="1" />
+  <path d="M1.5 -11.22h-3v-.4h3z" fill="#FF0000" stroke="#FF0000" stroke-width="1" />
   <path d="M1.5 -11.22h-3v-.4h3z" fill="#FF0000" stroke="#FF0000" stroke-width="1" />
 </svg>

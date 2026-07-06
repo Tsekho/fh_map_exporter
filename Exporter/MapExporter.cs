@@ -203,7 +203,11 @@ namespace Exporter
                 ["splines"]    = ToJObject(splines),
             };
 
+            // Proxy maps are lightweight blending regions; keep their JSON in a
+            // dedicated subfolder so they don't mix with real region exports.
             string jsonDir = Path.Combine(_exportFolder, "_json");
+            if (mapName.StartsWith("Proxy", StringComparison.OrdinalIgnoreCase))
+                jsonDir = Path.Combine(jsonDir, "proxies");
             Directory.CreateDirectory(jsonDir);
             string outPath = Path.Combine(jsonDir, mapName + ".json");
             File.WriteAllText(outPath, JsonOutput.Serialize(output));

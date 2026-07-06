@@ -40,6 +40,7 @@ from utils.config import (
     BRIDGES_AIM_SNAP_DIST_PX,
     BRIDGES_AIM_SNAP_TO_WATER_PX,
     BRIDGES_AIM_STROKE_PX,
+    BRIDGES_AIM_DIR,
     JSON_DIR,
     SVG_DIR,
     SVG_LAYERS,
@@ -48,8 +49,9 @@ from utils.config import (
 )
 
 # The "bridges_aim" layer is rendered procedurally (see
-# render_bridges_aim_layer) rather than by stamping its static symbols, so
-# the generic _build_layer_svg loop skips it.
+# render_bridges_aim_layer) into its own BRIDGES_AIM_DIR rather than by
+# stamping static symbols, so it is not part of SVG_LAYERS. This set is kept
+# as a defensive guard for the generic _build_layer_svg loop.
 _PROCEDURAL_LAYERS = {"bridges_aim"}
 
 
@@ -870,7 +872,7 @@ def render_bridges_aim_layer(
     water_dist: Optional[np.ndarray] = None,
 ) -> bool:
     """Render the procedural ``bridges_aim`` layer into
-    SVG_LAYERS_DIR/bridges_aim/<region_name>.png.
+    BRIDGES_AIM_DIR/<region_name>.png.
 
     ``water_dist`` is an optional float distance-to-shore field (0 on
     non-water) used to route the aim lines through navigable water. When None
@@ -888,7 +890,7 @@ def render_bridges_aim_layer(
     nav = (_Nav(water_dist, BRIDGES_AIM_MIN_CLEARANCE_PX)
            if water_dist is not None else None)
 
-    out_dir = SVG_LAYERS_DIR / "bridges_aim"
+    out_dir = BRIDGES_AIM_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{region_name}.png"
 

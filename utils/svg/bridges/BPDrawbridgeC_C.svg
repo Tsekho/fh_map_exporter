@@ -5,7 +5,7 @@
   <path d="m-5 54 v-16 h10 v16 z" fill="#ada9a2" opacity="0.8" />
   <path d="m5 -31 v9 h-10 v-9 z" fill="#ada9a2" opacity="0.8" />
   <path d="m-5 31 v-9 h10 v9 z" fill="#ada9a2" opacity="0.8" />
-  <path d="m0 0 v-92.75" stroke="#52e6a1" stroke-width="8" stroke-linecap="round" />
-  <path d="m0 0 v92.75" stroke="#52e6a1" stroke-width="8" stroke-linecap="round" />
-  <path d="m5 -15 v30 h-10 v-30 z" fill="#ada9a2" opacity="0.8" />
+  <path d="m0 0 v-92.75" stroke="#86B29D" stroke-width="8" stroke-linecap="round" />
+  <path d="m0 0 v92.75" stroke="#86B29D" stroke-width="8" stroke-linecap="round" />
+  <path d="m5 -15 v30 h-10 v-30 z" fill="#1c47d6" opacity="0.8" />
 </svg>

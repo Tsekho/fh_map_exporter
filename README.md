@@ -11,7 +11,7 @@ Updated for U65 devbranch phase 1.
 2_blend_all.py         ->  full-map Blender scenes → export/blend/<MapName>.blend
 3_blend_spills.py      ->  per-region .blend with neighbor spill → export/blend_spill/<Region>.blend
 4_render_spills.py     ->  top-down per-region bakes → export/{ao,heightmap_landscape,heightmap_water,
-                           roads,beaches,id/<cat>,split_layers/<layer>,svg_layers/<layer>}/<Region>.png
+                           roads,beaches,bridges_aim,id/<cat>,split_layers/<layer>,svg_layers/<layer>}/<Region>.png
 5_finalize_exports.py  ->  stitches bakes into world PNGs and assembles final composites
                            → export/_final/{technical,assembly,id,split_layers,svg_layers}/
 6_breaker.py           ->  interactive: break any world PNG back into per-region tiles
@@ -140,6 +140,8 @@ Outputs (per-region PNGs):
 - `svg_layers/<layer>/` - cairosvg raster of `utils/svg/<cat>/<name>.svg`
   instanced via `<use>` at every JSON transform. UE cm map to SVG px as
   `x = x_cm * 1776 / 189000 + 1024`.
+- `bridges_aim/` - procedural bridge aligning lines (own folder, not under
+  `svg_layers/`); stitched into `_final/assembly/bridges_aim.png` in step 5.
 
 Tunables in `utils/config.py`: `TERRAIN_WHITELIST` (categories that
 participate in ao/hm/id), `SPLIT_LAYERS`, `SVG_LAYERS`, `SPLINE_CATEGORIES`,
@@ -166,9 +168,13 @@ Output layout (under `export/_final/`):
 - `assembly/fly_alert.png` - `utils/fly_alert_pattern.png` tiled, alpha
   ramped between `FLY_ALERT_MIN_M` and `FLY_ALERT_MAX_M`, gated by
   `rocks_cov`.
-- `assembly/dive_alert.png` - `DIVE_ALERT_COLOR` where landscape is
-  below water surface; alpha fades 0..`DEEP_WATER_DEPTH`, gated by
-  `rocks_cov × water_cov`.
+- `assembly/dive_alert_obstacles.png` - `DIVE_ALERT_COLOR` over the submerged
+  non-terrain (obstacle) share of each pixel; alpha fades
+  0..`DEEP_WATER_DEPTH`, gated by `water_cov × (1 - terrain_cov)`.
+- `assembly/dive_alert_landscape.png` - `DIVE_ALERT_LANDSCAPE_COLOR` over the
+  submerged terrain share; alpha fades 0..`DIVE_ALERT_LANDSCAPE_DEPTH` (10 m),
+  gated by `water_cov × terrain_cov`. The two overlays partition each
+  submerged pixel via `terrain_cov`, so they never overlap.
 - `assembly/base_layer.png` - single terrain composite:
   `terrain_recolor` (weighted blend of `ID_RECOLOR` per non-water
   category, nearest-filled) + `shades` (terrain weightmaps with
@@ -181,7 +187,7 @@ Output layout (under `export/_final/`):
 - `assembly/ranges.png` - alpha-over of range svg_layers:
   `ranges_tap × ground`, `ranges_intel`, `ranges_ai × ground`,
   `ranges_mh`, `ranges_cg × water`, `ranges_aag`.
-- `svg_layers/bridges_aim.png` - bridge aligning lines, built procedurally in `4_render_spills.py`.
+- `assembly/bridges_aim.png` - bridge aligning lines, built procedurally in `4_render_spills.py` (per-region tiles in their own `bridges_aim/` folder).
 - `id/<cat>.png`, `split_layers/<layer>.png`, `svg_layers/<layer>.png`
   - verbatim stitches of the per-region bakes.
 

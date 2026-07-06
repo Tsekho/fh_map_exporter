@@ -26,6 +26,9 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Bcl.Memory" Version="10.0.6" />
+    <!-- Pin transitive MessagePack (via CUE4Parse) to a patched build; 3.1.4
+         has known vulnerabilities (CVE-2026-48506 and others). -->
+    <PackageReference Include="MessagePack" Version="3.1.7" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
     <PackageReference Include="Serilog" Version="4.3.0" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />

@@ -1,5 +1,5 @@
 prompt*
-.etc/
+/.etc/
 bin/
 obj/
 _*.py
@@ -9,3 +9,7 @@ __*
 /export/*
 !/export/_final/
 !/export/_extra/
+
+/utils/svg/ladders
+/export/_final/svg_layers/ladders.png
+/assembly/

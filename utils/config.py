@@ -56,6 +56,7 @@ BEACHES_DIR         = EXPORT_DIR / "beaches"
 SPLIT_LAYERS_DIR    = EXPORT_DIR / "split_layers"
 SVG_DIR             = UTILS_DIR / "svg"
 SVG_LAYERS_DIR      = EXPORT_DIR / "svg_layers"
+BRIDGES_AIM_DIR     = EXPORT_DIR / "bridges_aim"
 
 FINAL_DIR           = EXPORT_DIR / "_final"
 
@@ -302,9 +303,18 @@ SPLINE_COLORS: Dict[str, str] = {
     "beach":                   "#B6A177",
 }
 
-# RGB color (hex) used by the dive_alert overlay in 5_finalize_exports.py;
-# alpha fades from full at the water surface to 0 at DEEP_WATER_DEPTH.
+# RGB color (hex) used by the dive_alert_obstacles overlay in
+# 5_finalize_exports.py; alpha fades from full at the water surface to 0 at
+# DEEP_WATER_DEPTH, gated by the submerged non-terrain (obstacle) share of
+# each pixel: water_cov * (1 - terrain_cov).
 DIVE_ALERT_COLOR = "#BA759C"
+
+# RGB color (hex) and fade depth for the dive_alert_landscape overlay in
+# 5_finalize_exports.py; alpha fades from full at the water surface to 0 at
+# DIVE_ALERT_LANDSCAPE_DEPTH metres, covering submerged terrain
+# (water_cov * terrain_cov).
+DIVE_ALERT_LANDSCAPE_COLOR = "#839EAC"
+DIVE_ALERT_LANDSCAPE_DEPTH = 10.0
 
 # Per-layer colors used by 5_finalize_exports.py when compositing the
 # terrain weightmap layers under export/_layers/<layer>/ into a single
@@ -388,25 +398,23 @@ SVG_LAYERS: Dict[str, list] = {
     "foliage_invis": ["foliage_invis"],
     "rdz_grace":     ["rdz_grace"],
     "highlights":    ["stairs", "interiors"],
-    # bridges_aim is rendered procedurally (utils.svg_render
-    # .render_bridges_aim_layer), not by stamping symbols; the category list
-    # is unused. The entry is kept so 5_finalize_exports.py still stitches
-    # the per-region tiles into FINAL/svg_layers/bridges_aim.png.
-    "bridges_aim":   [],
     "drop_pads":     ["drop_pads"],
     "urban":         ["tiers", "safehouses"],
     "runways":       ["runways"],
     "runways_aim":   ["runways_aim"],
     "garrisons":     ["garrisons"],
+#    "ladders":       ["ladders"],
 }
 
 # ------------------------------------------------------------------------------
 #  Bridge aim lines (procedural; utils/svg_render.render_bridges_aim_layer)
 # ------------------------------------------------------------------------------
 #
-# The "bridges_aim" layer is special-cased: instead of stamping the static
-# utils/svg/bridges_aim/*.svg symbols, 4_render_spills.py computes the aim
-# lines per region. Every bridge gets two sockets emanating from its centre
+# The "bridges_aim" layer is rendered procedurally into its own
+# BRIDGES_AIM_DIR/<region>.png (not part of SVG_LAYERS) and is stitched by
+# 5_finalize_exports.py into FINAL_DIR/assembly/bridges_aim.png. Instead of
+# stamping the static utils/svg/bridges_aim/*.svg symbols, 4_render_spills.py
+# computes the aim lines per region. Every bridge gets two sockets emanating from its centre
 # along the passage axis (the bridge's local +x / -x). Each socket either:
 #   * snaps to a facing socket on a nearby bridge, forming a smooth curve
 #     that links the two crossings (so the line never crosses another
@@ -433,8 +441,8 @@ BRIDGES_AIM_LENGTH_PX = 90.0
 # Gap around the bridge centre where no line is drawn (legacy 5-unit gap).
 BRIDGES_AIM_GAP_PX = 10.0
 # Stroke width / colour of the rasterised aim lines.
-BRIDGES_AIM_STROKE_PX = 1.0
-BRIDGES_AIM_COLOR = "#B83535"
+BRIDGES_AIM_STROKE_PX = 1.2
+BRIDGES_AIM_COLOR = "#FFFFFF"
 
 # Snapping: two sockets on *different* bridges snap together when the two
 # bridge centres are within this distance AND the sockets face one another
