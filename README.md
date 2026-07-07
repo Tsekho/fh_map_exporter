@@ -1,7 +1,7 @@
 # Foxhole Map Exporter
 
 Python pipeline for exporting and processing maps from [Foxhole](https://store.steampowered.com/app/505460/Foxhole/).
-Updated for U65 devbranch phase 1.
+Updated for U65.
 
 ## Pipeline
 
