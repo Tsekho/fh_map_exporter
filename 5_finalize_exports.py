@@ -1,8 +1,7 @@
 """Stitch step-4 bakes into world PNGs and assemble final composites.
 
 Writes to ``export/_final/``: ``technical/`` (ao, heightmap_simple, contour),
-``assembly/`` (base_layer, beaches, roads, fly_alert, dive_alert_obstacles,
-dive_alert_landscape, contours,
+``assembly/`` (base_layer, beaches, roads, fly_alert, dive_alert, contours,
 rdz, ranges, bridges_aim), and verbatim ``id/``, ``split_layers/``,
 ``svg_layers/``.
 
@@ -26,10 +25,9 @@ from utils.config import (
     BEACHES_DIR,
     BRIDGES_AIM_DIR,
     CENTRES_FILE,
-    DEEP_WATER_DEPTH,
-    DIVE_ALERT_COLOR,
-    DIVE_ALERT_LANDSCAPE_COLOR,
-    DIVE_ALERT_LANDSCAPE_DEPTH,
+    DIVE_ALERT_BLUR_KSIZE,
+    DIVE_ALERT_BLUR_SIGMA,
+    DIVE_ALERT_GRADIENT,
     FINAL_DIR,
     FLY_ALERT_PATTERN_FILE,
     HM_LANDSCAPE_DIR,
@@ -391,111 +389,74 @@ def build_heightmap_simple(
     LOG.saved(out_path)
 
 
-def _dive_depth_ratio(
+def _hex_to_bgra(hex_str: str) -> Tuple[int, int, int, int]:
+    """#RRGGBB or #RRGGBBAA -> (b, g, r, a); alpha defaults to 255."""
+    s = hex_str.lstrip("#")
+    r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    a = int(s[6:8], 16) if len(s) >= 8 else 255
+    return (b, g, r, a)
+
+
+def build_dive_alert(
     raw_landscape: np.ndarray,
     raw_water: np.ndarray,
-    depth_m: float,
-) -> Tuple[np.ndarray, np.ndarray] | None:
-    """Return (ratio, valid) for submerged landscape. ``ratio`` fades
-    linearly from 1.0 at the water surface (depth 0) to 0 at ``depth_m``
-    metres below it; ``valid`` masks pixels with both heightmaps present
-    and a positive submersion depth. Returns None when nothing submerged."""
+    water_cov: np.ndarray,
+    world_alpha: np.ndarray,
+    out_path: Path,
+) -> None:
+    """RGBA overlay colouring each submerged pixel by its depth below the
+    water surface via DIVE_ALERT_GRADIENT: within each [start_m, end_m)
+    range the BGRA colour is interpolated linearly between the range's two
+    stops; depths past the last range stay transparent. Alpha is gated by
+    water_cov and the world hex mask."""
+    print("  building dive_alert...")
     valid = (raw_landscape != 0) & (raw_water != 0)
-    if not valid.any():
-        return None
     land_m = (raw_landscape.astype(np.float32) - 32768.0) / 100.0
     water_m = (raw_water.astype(np.float32) - 32768.0) / 100.0
     depth = water_m - land_m
-    denom = max(float(depth_m), 1e-6)
-    ratio = np.clip(1.0 - depth / denom, 0.0, 1.0)
-    valid = valid & (depth > 0)
-    return ratio, valid
+    valid &= depth > 0
+    if not valid.any():
+        print("  [info] no submerged pixels; dive_alert skipped")
+        return
 
+    height, width = depth.shape
+    bgra_f = np.zeros((height, width, 4), dtype=np.float32)
+    for start_m, end_m, hex_a, hex_b in DIVE_ALERT_GRADIENT:
+        seg = valid & (depth >= start_m) & (depth < end_m)
+        if not seg.any():
+            continue
+        t = (depth[seg] - start_m) / max(end_m - start_m, 1e-6)
+        ca = np.array(_hex_to_bgra(hex_a), dtype=np.float32)
+        cb = np.array(_hex_to_bgra(hex_b), dtype=np.float32)
+        bgra_f[seg] = ca[None, :] + (cb - ca)[None, :] * t[:, None]
 
-def _write_dive_alert(
-    ratio: np.ndarray,
-    valid: np.ndarray,
-    gate01: np.ndarray,
-    world_alpha: np.ndarray,
-    color_hex: str,
-    out_path: Path,
-) -> None:
-    """Compose and write a dive-alert RGBA overlay from a depth ratio,
-    a validity mask, and a 0..1 gate (e.g. coverage)."""
-    height, width = ratio.shape
-    alpha_f = ratio * gate01
-    alpha = np.clip(np.round(alpha_f * 255.0), 0, 255).astype(np.uint8)
-    alpha[~valid] = 0
-    alpha = np.minimum(alpha, world_alpha)
+    if DIVE_ALERT_BLUR_KSIZE and DIVE_ALERT_BLUR_KSIZE > 1:
+        # Normalized masked blur: only submerged pixels contribute, and the
+        # result is renormalized by the blurred mask so alpha keeps full
+        # strength up to the water edge instead of fading against land.
+        k = int(DIVE_ALERT_BLUR_KSIZE)
+        if k % 2 == 0:
+            k += 1
+        sig = float(DIVE_ALERT_BLUR_SIGMA)
+        eps = 1e-6
+        m = valid.astype(np.float32)
+        a = bgra_f[..., 3] * m
+        m_b = cv2.GaussianBlur(m, (k, k), sig)
+        a_b = cv2.GaussianBlur(a, (k, k), sig)
+        a_b_safe = np.maximum(a_b, eps)
+        for ch in range(3):
+            pc_b = cv2.GaussianBlur(bgra_f[..., ch] * a, (k, k), sig)
+            bgra_f[..., ch] = np.where(valid, pc_b / a_b_safe, 0.0)
+        bgra_f[..., 3] = np.where(valid, a_b / np.maximum(m_b, eps), 0.0)
 
-    bgr = _hex_to_bgr(color_hex)
+    alpha = bgra_f[..., 3] * (water_cov.astype(np.float32) / 255.0)
+    alpha = np.minimum(alpha, world_alpha.astype(np.float32))
+
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
-    hit = alpha > 0
-    rgba[hit, 0] = bgr[0]
-    rgba[hit, 1] = bgr[1]
-    rgba[hit, 2] = bgr[2]
-    rgba[..., 3] = alpha
-
+    rgba[..., 0:3] = np.clip(np.round(bgra_f[..., 0:3]), 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.clip(np.round(alpha), 0, 255).astype(np.uint8)
     _write_rgba(rgba, out_path)
     LOG.saved(out_path)
-
-
-def build_dive_alert_obstacles(
-    raw_landscape: np.ndarray,
-    raw_water: np.ndarray,
-    water_cov: np.ndarray,
-    world_alpha: np.ndarray,
-    landscape_cov: np.ndarray | None,
-    out_path: Path,
-) -> None:
-    """RGBA overlay coloured DIVE_ALERT_COLOR over the submerged share of
-    each pixel that is water but NOT landscape, i.e. obstacles sitting above
-    the heightmap terrain (rocks, meshes, etc.). Alpha fades linearly from
-    255 at the water surface (depth 0) to 0 at DEEP_WATER_DEPTH, gated by
-    (water_cov * (1 - landscape_cov))."""
-    print("  building dive_alert_obstacles...")
-    res = _dive_depth_ratio(raw_landscape, raw_water, DEEP_WATER_DEPTH)
-    if res is None:
-        print("  [info] no submerged pixels; dive_alert_obstacles skipped")
-        return
-    ratio, valid = res
-    gate01 = water_cov.astype(np.float32) / 255.0
-    if landscape_cov is not None:
-        gate01 = gate01 * (1.0 - landscape_cov.astype(np.float32) / 255.0)
-    _write_dive_alert(
-        ratio, valid, gate01, world_alpha, DIVE_ALERT_COLOR, out_path,
-    )
-
-
-def build_dive_alert_landscape(
-    raw_landscape: np.ndarray,
-    raw_water: np.ndarray,
-    water_cov: np.ndarray,
-    world_alpha: np.ndarray,
-    landscape_cov: np.ndarray | None,
-    out_path: Path,
-) -> None:
-    """RGBA overlay coloured DIVE_ALERT_LANDSCAPE_COLOR over the submerged
-    share of each pixel that is both water and landscape (terrain). Alpha
-    fades linearly from 255 at the water surface (depth 0) to 0 at
-    DIVE_ALERT_LANDSCAPE_DEPTH, gated by (water_cov * landscape_cov), so it
-    never overlaps dive_alert_obstacles."""
-    print("  building dive_alert_landscape...")
-    if landscape_cov is None:
-        print("  [WARN] landscape coverage missing; dive_alert_landscape skipped")
-        return
-    res = _dive_depth_ratio(raw_landscape, raw_water, DIVE_ALERT_LANDSCAPE_DEPTH)
-    if res is None:
-        print("  [info] no submerged pixels; dive_alert_landscape skipped")
-        return
-    ratio, valid = res
-    gate01 = (
-        (water_cov.astype(np.float32) / 255.0)
-        * (landscape_cov.astype(np.float32) / 255.0)
-    )
-    _write_dive_alert(
-        ratio, valid, gate01, world_alpha, DIVE_ALERT_LANDSCAPE_COLOR, out_path,
-    )
 
 
 # ------------------------------------------------------------------------------
@@ -875,7 +836,7 @@ def main() -> int:
     if HM_LANDSCAPE_DIR.is_dir():  est += 3  # fly_alert, contour, contours
     if HM_WATER_DIR.is_dir():      est += 1  # heightmap_simple
     if HM_LANDSCAPE_DIR.is_dir() and HM_WATER_DIR.is_dir():
-        est += 2  # dive_alert_obstacles, dive_alert_landscape
+        est += 1  # dive_alert
     est += 3  # base_layer, rdz, ranges (may skip)
     LOG.set_total(est)
 
@@ -1034,13 +995,9 @@ def main() -> int:
         and raw_water is not None
         and water_cov is not None
     ):
-        build_dive_alert_obstacles(
-            raw_landscape, raw_water, water_cov, world_alpha, terrain_cov,
-            FINAL_DIR / ASSEMBLY_DIR / "dive_alert_obstacles.png",
-        )
-        build_dive_alert_landscape(
-            raw_landscape, raw_water, water_cov, world_alpha, terrain_cov,
-            FINAL_DIR / ASSEMBLY_DIR / "dive_alert_landscape.png",
+        build_dive_alert(
+            raw_landscape, raw_water, water_cov, world_alpha,
+            FINAL_DIR / ASSEMBLY_DIR / "dive_alert.png",
         )
     else:
         print("  [WARN] missing heightmap/water coverage; skipping dive_alert")

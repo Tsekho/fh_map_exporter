@@ -303,18 +303,28 @@ SPLINE_COLORS: Dict[str, str] = {
     "beach":                   "#B6A177",
 }
 
-# RGB color (hex) used by the dive_alert_obstacles overlay in
-# 5_finalize_exports.py; alpha fades from full at the water surface to 0 at
-# DEEP_WATER_DEPTH, gated by the submerged non-terrain (obstacle) share of
-# each pixel: water_cov * (1 - terrain_cov).
-DIVE_ALERT_COLOR = "#BA759C"
+# Depth-graded dive_alert overlay in 5_finalize_exports.py. Each entry maps
+# a submersion-depth range [start_m, end_m) to a colour gradient: the overlay
+# colour fades linearly from the first hex at start_m to the second hex at
+# end_m. Hex accepts #RRGGBB (alpha 255) or #RRGGBBAA. Ranges must be listed
+# ascending and contiguous; depths past the last range render transparent.
+# The overlay is gated by water coverage, replacing the old
+# obstacles/landscape 2-split.
+DIVE_ALERT_GRADIENT = [
+    (0.0,  1.4, "#86B29D88", "#86B29D88"), # Walkable
+    (1.4,  1.7, "#62827288", "#62827288"), # Truck-drivable
+    (1.7,  7.0, "#BA759C88", "#BA759C44"), # Surface ships might beach 
+    (7.0, 14.2, "#6980EF88", "#6980EF44"), # Submarines might show on intel
+]
 
-# RGB color (hex) and fade depth for the dive_alert_landscape overlay in
-# 5_finalize_exports.py; alpha fades from full at the water surface to 0 at
-# DIVE_ALERT_LANDSCAPE_DEPTH metres, covering submerged terrain
-# (water_cov * terrain_cov).
-DIVE_ALERT_LANDSCAPE_COLOR = "#839EAC"
-DIVE_ALERT_LANDSCAPE_DEPTH = 10.0
+# Gaussian blur smoothing dive_alert band transitions. Applied as a
+# water-masked normalized blur: only pixels inside the water mask
+# contribute and the result is renormalized by the blurred mask, so the
+# overlay never bleeds onto land and its alpha doesn't weaken at the
+# shoreline (the land->water edge stays sharp via the water_cov gate).
+# Kernel must be odd; 0 disables.
+DIVE_ALERT_BLUR_KSIZE = 3
+DIVE_ALERT_BLUR_SIGMA = 0.0  # 0 => cv2 derives sigma from kernel size
 
 # Per-layer colors used by 5_finalize_exports.py when compositing the
 # terrain weightmap layers under export/_layers/<layer>/ into a single
@@ -471,6 +481,10 @@ BRIDGES_AIM_FACE_MIN_DOT = 0.7
 # studded with control points every few pixels).
 #
 #   WATER_THRESH         coverage [0..255] at/above which a pixel is water
+#   MIN_DEPTH_M          minimum submersion depth (m; water heightmap minus
+#                        landscape heightmap) for a water pixel to count as
+#                        navigable -- freighters run aground in shallower
+#                        water. 0 disables the depth gate (coverage only).
 #   MIN_CLEARANCE_PX     erosion radius / min distance-to-shore (px) kept by
 #                        every control point and the curve spanning them
 #   SNAP_TO_WATER_PX     max radius used to pull a bridge gap onto navigable
@@ -489,6 +503,29 @@ BRIDGES_AIM_FACE_MIN_DOT = 0.7
 #                        further to chase clearance (see exception above)
 #   CURVE_CHECK_STEP_PX  spacing of samples used when testing curve clearance
 #   REFINE_PASSES        max subdivision passes enforcing curve clearance
+#   LATERAL_BIAS         penalty per pixel of sideways offset when picking an
+#                        unpaired socket's endpoint (score = along-axis reach
+#                        minus LATERAL_BIAS * |perpendicular offset|). The
+#                        Dijkstra reach budget is measured in octile grid
+#                        distance, so in open water the farthest-projection
+#                        cell snaps to the nearest of the 8 compass directions
+#                        instead of the socket axis; this penalty makes the
+#                        on-axis cell win unless the channel genuinely bends
+#                        the route. 0 restores raw projection.
+#   END_DEPTH_BIAS       penalty per pixel that an endpoint's distance-to-
+#                        shore falls below CHANNEL_PREF_PX. Without it the
+#                        line ends wherever a few extra pixels of along-axis
+#                        reach exist -- often a pocket right at the clearance
+#                        boundary, which puts a tiny end-hook aiming the line
+#                        into the shore. In a uniformly narrow river every
+#                        cell is penalised alike, so reach is unaffected.
+#   END_TRIM_PX          after routing, the tail of an unpaired line is cut
+#                        back to the deepest cell within this many path-px of
+#                        the end. Even with END_DEPTH_BIAS the along-axis
+#                        reach can pay for a tail that descends toward shore;
+#                        the spline's end tangent then points the tip at the
+#                        bank. Trimming guarantees the line never *ends* on a
+#                        shoreward approach. 0 disables.
 #   PAIR_MAX_DETOUR      a snapped pair's water route is accepted only when its
 #                        length is at most this multiple of the straight gap-
 #                        to-gap distance. When two close, slightly misaligned
@@ -498,6 +535,7 @@ BRIDGES_AIM_FACE_MIN_DOT = 0.7
 #                        that crosses back over it. Past this ratio the route
 #                        is rejected in favour of a short, direct connector.
 BRIDGES_AIM_WATER_THRESH = 200
+BRIDGES_AIM_MIN_DEPTH_M = 4.0
 BRIDGES_AIM_MIN_CLEARANCE_PX = 10.0
 BRIDGES_AIM_SNAP_TO_WATER_PX = 30.0
 BRIDGES_AIM_CENTER_BIAS = 3.0
@@ -505,4 +543,7 @@ BRIDGES_AIM_CHANNEL_PREF_PX = 30.0
 BRIDGES_AIM_MIN_CTRL_SPACING_PX = 9.0
 BRIDGES_AIM_CURVE_CHECK_STEP_PX = 1.5
 BRIDGES_AIM_REFINE_PASSES = 24
+BRIDGES_AIM_LATERAL_BIAS = 1.5
+BRIDGES_AIM_END_DEPTH_BIAS = 1.0
+BRIDGES_AIM_END_TRIM_PX = 25.0
 BRIDGES_AIM_PAIR_MAX_DETOUR = 1.6

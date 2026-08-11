@@ -65,6 +65,6 @@
     </g>
   </defs>
 
-  <use href="#ticks" fill="none" stroke="#FF00FF" stroke-width="2.75" stroke-linejoin="round" stroke-linecap="round" />
-  <use href="#ticks" fill="none" stroke="#FFFF00" stroke-width="1.25" stroke-linejoin="round" stroke-linecap="round" />
+  <use href="#ticks" fill="none" stroke="#000000" stroke-width="3.5" stroke-linejoin="round" stroke-linecap="round" />
+  <use href="#ticks" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" />
 </svg>

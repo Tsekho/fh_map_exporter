@@ -31,7 +31,10 @@ from utils.config import (
     BRIDGES_AIM_COLOR,
     BRIDGES_AIM_CURVE_CHECK_STEP_PX,
     BRIDGES_AIM_FACE_MIN_DOT,
+    BRIDGES_AIM_END_DEPTH_BIAS,
+    BRIDGES_AIM_END_TRIM_PX,
     BRIDGES_AIM_GAP_PX,
+    BRIDGES_AIM_LATERAL_BIAS,
     BRIDGES_AIM_LENGTH_PX,
     BRIDGES_AIM_MIN_CLEARANCE_PX,
     BRIDGES_AIM_MIN_CTRL_SPACING_PX,
@@ -621,6 +624,34 @@ def _axis_entry(
     return best
 
 
+def _trim_shoreward_tail(
+    pts: List[Tuple[float, float]], nav: _Nav, max_trim: float
+) -> List[Tuple[float, float]]:
+    """Cut back a route tail that descends toward shore.
+
+    Within the last ``max_trim`` path-pixels, the route is truncated at its
+    deepest cell (largest distance-to-shore). A tail whose depth only
+    decreases -- an approach into the bank -- is removed entirely from the
+    deepest point on; a tail through open water (depth flat or rising toward
+    the end) is left untouched."""
+    if max_trim <= 0.0 or len(pts) < 3:
+        return pts
+    wd = nav.water_dist
+    best_i = len(pts) - 1
+    best_d = float(wd[int(pts[-1][1]), int(pts[-1][0])])
+    acc = 0.0
+    i = len(pts) - 1
+    while i > 1 and acc < max_trim:
+        x1, y1 = pts[i]
+        x0, y0 = pts[i - 1]
+        acc += math.hypot(x1 - x0, y1 - y0)
+        i -= 1
+        d = float(wd[int(pts[i][1]), int(pts[i][0])])
+        if d > best_d:
+            best_d, best_i = d, i
+    return pts[:best_i + 1]
+
+
 def _trace_outward(sock: _Socket, nav: _Nav) -> Optional[List[Tuple[float, float]]]:
     """Route an unpaired socket outward along the channel.
 
@@ -642,13 +673,34 @@ def _trace_outward(sock: _Socket, nav: _Nav) -> Optional[List[Tuple[float, float
     if len(geo) < 2:
         return None
 
+    # Endpoint score: along-axis reach minus penalties for sideways offset
+    # and for ending in shallow water.
+    #
+    # Sideways: the reach budget is octile grid distance, so in open water
+    # the raw farthest-projection cell snaps to the nearest compass direction
+    # (the reachable set is an octagon with vertices on the 8 grid
+    # directions); penalising the perpendicular offset makes the on-axis cell
+    # win unless the channel actually bends the route.
+    #
+    # Shallow: without a depth term the endpoint drifts into whichever
+    # near-shore pocket offers a few extra pixels of reach, which is rarely
+    # line-of-sight from the main chord and so leaves a tiny final vertex --
+    # a hook aiming the line into the shore.
     sr, sc = start
+    wd = nav.water_dist
     best = start
-    best_proj = 0.0
+    best_score = -1e18
     for (r, c) in geo:
-        proj = (c - sc) * sock.ux + (r - sr) * sock.uy
-        if proj > best_proj:
-            best_proj, best = proj, (r, c)
+        dx, dy = c - sc, r - sr
+        proj = dx * sock.ux + dy * sock.uy
+        if proj <= 0.0:
+            continue
+        perp = abs(dx * -sock.uy + dy * sock.ux)
+        shallow = max(0.0, nav.pref - float(wd[r, c]))
+        score = (proj - BRIDGES_AIM_LATERAL_BIAS * perp
+                 - BRIDGES_AIM_END_DEPTH_BIAS * shallow)
+        if score > best_score:
+            best_score, best = score, (r, c)
 
     if best == start:
         # No water ahead along the axis; follow the channel to its far end.
@@ -657,7 +709,9 @@ def _trace_outward(sock: _Socket, nav: _Nav) -> Optional[List[Tuple[float, float
             return None
 
     cells = _trace_back(came, start, best)
-    return [(float(c), float(r)) for r, c in cells]
+    pts = [(float(c), float(r)) for r, c in cells]
+    pts = _trim_shoreward_tail(pts, nav, BRIDGES_AIM_END_TRIM_PX)
+    return pts if len(pts) >= 2 else None
 
 
 def _astar_grid(

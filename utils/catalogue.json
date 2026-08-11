@@ -1844,6 +1844,16 @@
     "Meshes__Weapons__Windsock",
     "Meshes__Weapons__binoculars",
     "Meshes__Shippables__ShippingContainerLargeExposed",
-    "Meshes__Structures__AAspoteLight"
+    "Meshes__Structures__AAspoteLight",
+    "Blueprints__Vehicles__AircraftParatrooperC__AirCraftParatrooperC__AntiswimVolume",
+    "Blueprints__Vehicles__AircraftParatrooperC__AircraftParatrooperCAirCollision",
+    "Blueprints__Vehicles__AircraftParatrooperC__SK_AircraftParatrooperCBody",
+    "Blueprints__Vehicles__AircraftParatrooperC__SK_AircraftParatrooperCRoof",
+    "Blueprints__Vehicles__Aircraft__AircraftFighterW__Meshes__AircraftFighterW_PrototypeCollision",
+    "Blueprints__Vehicles__Aircraft__AircraftFighterW__Meshes__SK_AircraftFighterW",
+    "Blueprints__Vehicles__Aircraft__AircraftScoutW__Meshes__AircraftScoutWPrototypeCollision",
+    "Blueprints__Vehicles__Aircraft__AircraftScoutW__Meshes__SK_AircraftScoutW",
+    "Blueprints__Vehicles__LightBoats__FreighterLight__LightFreighterCrates",
+    "Meshes__Weapons__MiniTorpedoAmmo"
   ]
 }

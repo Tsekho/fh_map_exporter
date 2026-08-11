@@ -1,13 +1,20 @@
 """Render top-down bakes for every region .blend.
 
-Outputs:
+Outputs (each flag gates its own set of per-region PNGs):
     -svg  ->  export/svg_layers/<layer>/<Region>.png
+              + export/bridges_aim/<Region>.png (procedural aim lines)
     -ao   ->  export/ao/<Region>.png
     -hm   ->  export/heightmap_landscape/<Region>.png
-    -id   ->  export/id/<Region>.png + export/water/<Region>.png
+              + export/heightmap_water/<Region>.png
+    -id   ->  export/id/<category>/<Region>.png (incl. id/water/)
+    -r    ->  export/roads/<Region>.png
+    -b    ->  export/beaches/<Region>.png
+    -sl   ->  export/split_layers/<layer>/<Region>.png
 
 Usage:
-    python 4_render_spills.py [RegionName] [-a] [-svg] [-ao] [-hm] [-id]
+    python 4_render_spills.py [RegionName] [-a]
+        [-svg] [-ao] [-hm] [-id] [-r] [-b] [-sl]
+    (no bake flags = all bakes)
 """
 
 import argparse
@@ -24,6 +31,7 @@ from utils.config import (
     AO_DIR,
     BEACHES_CATS,
     BEACHES_DIR,
+    BRIDGES_AIM_MIN_DEPTH_M,
     BRIDGES_AIM_WATER_THRESH,
     CATEGORY_COLORS,
     HM_LANDSCAPE_DIR,
@@ -64,18 +72,33 @@ def _load_region_water_dist(region_name: str) -> Optional[np.ndarray]:
     water ID coverage PNG, or None when it's not on disk yet.
 
     A pixel counts as water when its coverage is at least
-    BRIDGES_AIM_WATER_THRESH. This deliberately uses only the water mask:
-    over a river the terrain coverage is zero, but the water bake records
-    bridge decks as non-water (they occlude the surface), so aim lines stop
-    before crossing another bridge. The distance transform lets the aim
-    tracer steer toward the more open side of the channel."""
+    BRIDGES_AIM_WATER_THRESH AND, when the region's landscape/water
+    heightmap bakes are present, it is submerged by at least
+    BRIDGES_AIM_MIN_DEPTH_M metres (freighters ground in shallower water).
+    Bridge decks read as non-water in the water bake (they occlude the
+    surface), so aim lines stop before crossing another bridge. The
+    distance transform lets the aim tracer steer toward the more open
+    side of the channel."""
     water_path = ID_DIR / "water" / f"{region_name}.png"
     if not water_path.is_file():
         return None
     wc = cv2.imread(str(water_path), cv2.IMREAD_GRAYSCALE)
     if wc is None:
         return None
-    water = (wc >= BRIDGES_AIM_WATER_THRESH).astype(np.uint8) * 255
+    water = wc >= BRIDGES_AIM_WATER_THRESH
+    if BRIDGES_AIM_MIN_DEPTH_M > 0:
+        hl = cv2.imread(
+            str(HM_LANDSCAPE_DIR / f"{region_name}.png"), cv2.IMREAD_UNCHANGED)
+        hw = cv2.imread(
+            str(HM_WATER_DIR / f"{region_name}.png"), cv2.IMREAD_UNCHANGED)
+        if hl is None or hw is None:
+            print("  [WARN] bridges_aim: heightmap bake(s) missing; "
+                  "navigability depth gate skipped")
+        else:
+            depth_cm = hw.astype(np.int32) - hl.astype(np.int32)
+            deep = depth_cm >= int(round(BRIDGES_AIM_MIN_DEPTH_M * 100))
+            water &= (hl != 0) & (hw != 0) & deep
+    water = water.astype(np.uint8) * 255
     return cv2.distanceTransform(water, cv2.DIST_L2, 3)
 
 
@@ -631,6 +654,16 @@ def pick_region_interactive(blends: List[Path]) -> Optional[List[Path]]:
 
 
 def ask_bakes() -> Tuple[bool, bool, bool, bool, bool, bool, bool]:
+    print(
+        "Bakes:\n"
+        "  svg -> svg_layers/<layer> + bridges_aim\n"
+        "  ao  -> ao\n"
+        "  hm  -> heightmap_landscape + heightmap_water\n"
+        "  id  -> id/<category> (incl. id/water)\n"
+        "  r   -> roads\n"
+        "  b   -> beaches\n"
+        "  sl  -> split_layers/<layer>"
+    )
     while True:
         raw = input(
             "Select bakes (space-separated from: svg ao hm id r b sl; "
@@ -654,7 +687,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Render bakes for every region .blend in export/blend_spill. "
-            "If none of -ao/-hm/-id is given, all bakes are produced."
+            "If no bake flags are given, all bakes are produced."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -662,19 +695,23 @@ def main() -> int:
                         help="Region stem; omit for interactive prompt")
     parser.add_argument("-a", "--all", action="store_true",
                         help="Render every .blend in export/blend_spill")
-    parser.add_argument("-ao", dest="do_ao", action="store_true")
-    parser.add_argument("-hm", dest="do_hm", action="store_true")
-    parser.add_argument("-id", dest="do_id", action="store_true")
+    parser.add_argument("-ao", dest="do_ao", action="store_true",
+                        help="Render the AO bake")
+    parser.add_argument("-hm", dest="do_hm", action="store_true",
+                        help="Render heightmap_landscape + heightmap_water")
+    parser.add_argument("-id", dest="do_id", action="store_true",
+                        help="Render per-category ID coverage "
+                             "(incl. id/water)")
     parser.add_argument("-svg", dest="do_svg", action="store_true",
                         help="Rasterize SVG_LAYERS into "
-                             "export/svg_layers/<layer>/<region>.png")
+                             "export/svg_layers/<layer>/<region>.png "
+                             "and render the procedural bridges_aim layer")
     parser.add_argument("-r", dest="do_roads", action="store_true",
                         help="Render the roads layer")
     parser.add_argument("-b", dest="do_beaches", action="store_true",
                         help="Render the beaches layer")
     parser.add_argument("-sl", dest="do_split_layers", action="store_true",
-                        help="Render per-category split layers "
-                             "(urban/industry/ghouses)")
+                        help="Render the SPLIT_LAYERS bakes")
     args = parser.parse_args()
 
     blends = _list_blends()

@@ -1,7 +1,12 @@
 # Foxhole Map Exporter
 
 Python pipeline for exporting and processing maps from [Foxhole](https://store.steampowered.com/app/505460/Foxhole/).
-Updated for U65.
+Updated for U66 Devbranch Phase 1.
+
+### Credits
+
+The amazing idea of thresholded water depth coloring was adopted from
+[Knight of Science's fork](https://github.com/Knight-of-Science/fh_map_exporter).
 
 ## Pipeline
 
@@ -115,7 +120,7 @@ Output: `export/blend_spill/<Region>.blend`.
 
 ### Step 4 - Render Region Bakes
 
-Opens each spill `.blend` and renders top-down 2048×2048 bakes. Without
+Opens each spill `.blend` and renders top-down `TILE_SIZE`×`TILE_SIZE` bakes. Without
 any of `-svg`/`-ao`/`-hm`/`-id`/`-r`/`-b`/`-sl`, all bakes are produced.
 The `-svg` pass reads `export/_json/<region>.json` directly and runs
 before the `.blend` is opened; all others need Blender.
@@ -127,21 +132,23 @@ python 4_render_spills.py -a            # all regions
 python 4_render_spills.py -a -ao -id    # subset
 ```
 
-Outputs (per-region PNGs):
+Outputs (per-region PNGs; the flag producing each is in parentheses):
 
-- `ao/`, `heightmap_landscape/`, `heightmap_water/` - grayscale bakes.
+- `ao/` (`-ao`) - grayscale AO bake with slope shading.
+- `heightmap_landscape/`, `heightmap_water/` (`-hm`) - grayscale bakes.
   `heightmap_landscape` passes through water; `heightmap_water` stops
   on the water surface.
-- `roads/`, `beaches/` - RGBA spline coverage (SSAA, colored via
+- `roads/` (`-r`), `beaches/` (`-b`) - RGBA spline coverage (SSAA, colored via
   `SPLINE_COLORS`). Beaches alpha is masked to `terrain × (not water)`.
-- `id/<category>/` - 8-bit coverage per category (`ID_SSAA`).
-- `split_layers/<layer>/` - RGBA Cycles AO per split layer; each
+- `id/<category>/` (`-id`) - 8-bit coverage per category (`ID_SSAA`),
+  including the water coverage in `id/water/`.
+- `split_layers/<layer>/` (`-sl`) - RGBA Cycles AO per split layer; each
   category is tinted via its color from `SPLIT_LAYERS`.
-- `svg_layers/<layer>/` - cairosvg raster of `utils/svg/<cat>/<name>.svg`
+- `svg_layers/<layer>/` (`-svg`) - cairosvg raster of `utils/svg/<cat>/<name>.svg`
   instanced via `<use>` at every JSON transform. UE cm map to SVG px as
   `x = x_cm * 1776 / 189000 + 1024`.
-- `bridges_aim/` - procedural bridge aligning lines (own folder, not under
-  `svg_layers/`); stitched into `_final/assembly/bridges_aim.png` in step 5.
+- `bridges_aim/` (`-svg`) - procedural bridge aligning lines (own folder, not
+  under `svg_layers/`); stitched into `_final/assembly/bridges_aim.png` in step 5.
 
 Tunables in `utils/config.py`: `TERRAIN_WHITELIST` (categories that
 participate in ao/hm/id), `SPLIT_LAYERS`, `SVG_LAYERS`, `SPLINE_CATEGORIES`,
@@ -168,13 +175,13 @@ Output layout (under `export/_final/`):
 - `assembly/fly_alert.png` - `utils/fly_alert_pattern.png` tiled, alpha
   ramped between `FLY_ALERT_MIN_M` and `FLY_ALERT_MAX_M`, gated by
   `rocks_cov`.
-- `assembly/dive_alert_obstacles.png` - `DIVE_ALERT_COLOR` over the submerged
-  non-terrain (obstacle) share of each pixel; alpha fades
-  0..`DEEP_WATER_DEPTH`, gated by `water_cov × (1 - terrain_cov)`.
-- `assembly/dive_alert_landscape.png` - `DIVE_ALERT_LANDSCAPE_COLOR` over the
-  submerged terrain share; alpha fades 0..`DIVE_ALERT_LANDSCAPE_DEPTH` (10 m),
-  gated by `water_cov × terrain_cov`. The two overlays partition each
-  submerged pixel via `terrain_cov`, so they never overlap.
+- `assembly/dive_alert.png` - depth-graded overlay: each submerged pixel is
+  coloured by its depth below the water surface via `DIVE_ALERT_GRADIENT`
+  (a list of depth ranges, each with a start/end `#RRGGBB[AA]` colour pair
+  interpolated linearly across the range; depths past the last range are
+  transparent). Band transitions are smoothed by a water-masked normalized
+  blur (`DIVE_ALERT_BLUR_*`) that never bleeds onto land or weakens the
+  shoreline edge. Alpha is gated by `water_cov`.
 - `assembly/base_layer.png` - single terrain composite:
   `terrain_recolor` (weighted blend of `ID_RECOLOR` per non-water
   category, nearest-filled) + `shades` (terrain weightmaps with
@@ -205,7 +212,7 @@ asks whether to downscale to 1k.
 python 6_breaker.py
 ```
 
-For each region, extracts a 2048x2048 crop centred on the region's
+For each region, extracts a `TILE_SIZE`×`TILE_SIZE` crop centred on the region's
 world-pixel coordinates, multiplies `mask.png` into the alpha channel,
 then saves either:
 
