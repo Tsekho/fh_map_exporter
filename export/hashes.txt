@@ -44,7 +44,7 @@ SableportHex.json         dfd8a44c
 ShackledChasmHex.json     cb784c2b
 SpeakingWoodsHex.json     0c8efbf0
 StemaLandingHex.json      896bf407
-StlicanShelfHex.json      29671692
+StlicanShelfHex.json      fccc345b
 StonecradleHex.json       4a8604fb
 TempestIslandHex.json     efeade35
 TerminusHex.json          e33af7e9
