@@ -211,7 +211,7 @@ def build_region_with_spill(
         if c not in CATEGORY_COLORS
     ]
     if missing_color:
-        warn(f"  [WARN] No CATEGORY_COLORS entry for: "
+        warn(f"  No CATEGORY_COLORS entry for: "
              f"{', '.join(missing_color)} - those categories will be skipped")
     spill_categories = [c for c in spill_categories if c in CATEGORY_COLORS]
 
@@ -236,7 +236,7 @@ def build_region_with_spill(
     own_name = json_name_map[region_key]
     own_json = os.path.join(export_dir, "_json", f"{own_name}.json")
     if not os.path.exists(own_json):
-        error(f"ERROR: JSON not found: {own_json}")
+        error(f"JSON not found: {own_json}")
         return
 
     own_center = region_center_to_blender(region_centers[region_key])
@@ -363,11 +363,11 @@ def build_region_with_spill(
     for neigh_key in neighbors:
         neigh_name = json_name_map.get(neigh_key)
         if neigh_name is None:
-            warn(f"  [WARN] No JSON for neighbor '{neigh_key}', skipped")
+            warn(f"  No JSON for neighbor '{neigh_key}', skipped")
             continue
         neigh_json = os.path.join(export_dir, "_json", f"{neigh_name}.json")
         if not os.path.exists(neigh_json):
-            warn(f"  [WARN] Missing neighbor JSON: {neigh_json}")
+            warn(f"  Missing neighbor JSON: {neigh_json}")
             continue
 
         neigh_center = region_center_to_blender(region_centers[neigh_key])

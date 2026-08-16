@@ -41,7 +41,7 @@ import sys
 import threading
 import time
 from types import FrameType, TracebackType
-from typing import Optional, TextIO, Type
+from typing import Optional, TextIO, Tuple, Type
 
 from utils.config import TUI_BAR_WIDTH, TUI_TICK_INTERVAL_S
 
@@ -55,6 +55,59 @@ _BOLD = f"{_CSI}1m"
 _DIM = f"{_CSI}2m"
 _CYAN = f"{_CSI}36m"
 _GREEN = f"{_CSI}32m"
+_FG_BLACK = f"{_CSI}30m"
+_FG_WHITE = f"{_CSI}97m"
+_BG_CYAN = f"{_CSI}46m"
+_BG_YELLOW = f"{_CSI}43m"
+_BG_RED = f"{_CSI}41m"
+
+# Level tags for log()/warn()/error(): text + (background, foreground).
+# Padded to a common width so every tag occupies the same on-screen
+# width regardless of level.
+_LEVEL_TAGS = {"info": "INFO", "warn": "WARN", "error": "ERROR"}
+_LEVEL_COLORS = {
+    "info": (_BG_CYAN, _FG_WHITE),
+    "warn": (_BG_YELLOW, _FG_BLACK),
+    "error": (_BG_RED, _FG_WHITE),
+}
+_LEVEL_TAG_WIDTH = max(len(tag) for tag in _LEVEL_TAGS.values())
+
+
+def _tag_prefix(level: str, *, colored: bool) -> str:
+    """Left-aligned, fixed-width level tag with one space of padding on
+    each side, e.g. " INFO  " / " WARN  " / " ERROR ". Colored with a
+    background block when the stream supports ANSI, else a plain
+    bracketed fallback of the same tag width."""
+    tag = _LEVEL_TAGS.get(level, _LEVEL_TAGS["info"]).ljust(_LEVEL_TAG_WIDTH)
+    if not colored:
+        return f"[{tag}] "
+    bg, fg = _LEVEL_COLORS.get(level, _LEVEL_COLORS["info"])
+    return f"{bg}{fg}{_BOLD} {tag} {_RESET} "
+
+
+def _tag_lines(message: str, level: str, *, colored: bool) -> str:
+    """Prefix every non-blank line of ``message`` with a level tag; blank
+    lines (e.g. the leading "\\n" in banner-style messages) are left
+    untouched rather than getting a tagged empty row."""
+    prefix = _tag_prefix(level, colored=colored)
+    return "\n".join(
+        prefix + line if line else line for line in message.split("\n")
+    )
+
+
+def strip_tag(line: str) -> Tuple[str, str]:
+    """If ``line`` starts with a plain (uncolored) level tag -- as
+    produced by a child process's own non-interactive log()/warn()/
+    error() fallback -- return ``(level, remainder)`` with the tag and
+    its trailing space removed. Otherwise return ``("info", line)``
+    unchanged. Used by utils/parallel.py so a forwarded child-process
+    line that was already an ERROR/WARN gets re-tagged at that level
+    instead of being wrapped in a second, misleading INFO tag."""
+    for level, tag in _LEVEL_TAGS.items():
+        prefix = f"[{tag.ljust(_LEVEL_TAG_WIDTH)}] "
+        if line.startswith(prefix):
+            return level, line[len(prefix):]
+    return "info", line
 
 # Minimum bar-graphic width worth drawing; below this it's dropped
 # entirely so the percent/count/elapsed suffix -- which is never
@@ -296,17 +349,17 @@ class ScriptTUI:
     # -- public API ----------------------------------------------------------
 
     def log(self, message: str = "", *, level: str = "info") -> None:
-        del level  # reserved for future color-coding; unused for now
         with self._lock:
             if not self._interactive:
-                print(message, file=self._stream)
+                print(_tag_lines(message, level, colored=False), file=self._stream)
                 return
+            tagged = _tag_lines(message, level, colored=True)
             if self._suspended:
-                self._stream.write(message + "\n")
+                self._stream.write(tagged + "\n")
                 self._stream.flush()
                 return
             self._stream.write("\r" + _CLEAR_LINE)
-            for line in message.split("\n"):
+            for line in tagged.split("\n"):
                 self._stream.write(line + "\n")
             self._redraw_locked()
 
@@ -376,7 +429,7 @@ def log(message: str = "", *, level: str = "info") -> None:
     if _ACTIVE is not None:
         _ACTIVE.log(message, level=level)
     else:
-        print(message)
+        print(_tag_lines(message, level, colored=False))
 
 
 def warn(message: str) -> None:

@@ -19,7 +19,7 @@ import time
 from typing import Callable, List, Sequence
 
 from utils.config import REPO_ROOT
-from utils.tui import ScriptTUI
+from utils.tui import ScriptTUI, strip_tag
 
 
 # Match any absolute path that starts with REPO_ROOT (both "\" and "/"
@@ -54,11 +54,16 @@ def _pump(label: str, proc: subprocess.Popen, tui: ScriptTUI) -> None:
 
     Repo-root absolute paths in the line are rewritten to repo-relative
     POSIX paths so Blender's native log output doesn't dump 100+ char
-    absolute paths.
+    absolute paths. The child runs with piped (non-interactive) stdout,
+    so its own log()/warn()/error() calls already carry a plain "[LEVEL]"
+    tag -- that tag is parsed off and reapplied via ``level=`` instead of
+    being forwarded as literal text, so a child's ERROR/WARN line isn't
+    wrapped in a second, misleading INFO tag here.
     """
     assert proc.stdout is not None
     for line in proc.stdout:
-        tui.log(f"[{label}] {_shorten_paths(line).rstrip()}")
+        level, remainder = strip_tag(_shorten_paths(line).rstrip())
+        tui.log(f"[{label}] {remainder}", level=level)
 
 
 def run_parallel_subprocesses(
@@ -126,7 +131,7 @@ def run_parallel_subprocesses(
             thread.join(timeout=5)
             rc = proc.returncode
             status = "OK" if rc == 0 else f"FAILED (rc={rc})"
-            tui.log(f"[{label}] done: {status}")
+            tui.log(f"[{label}] done: {status}", level="info" if rc == 0 else "error")
             tui.advance()
             if rc != 0:
                 failed.append(item)

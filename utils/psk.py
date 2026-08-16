@@ -149,9 +149,9 @@ def get_mesh(mesh_name: str, meshes_dir: str) -> Optional[bpy.types.Mesh]:
                     mesh = psk_to_blender_mesh(pts, wdgs, fcs, mesh_name)
                     mesh_cache[mesh_name] = mesh
                     return mesh
-                warn(f"  [WARN] Empty PSK: {path}")
+                warn(f"  Empty PSK: {path}")
             except Exception as exc:
-                warn(f"  [WARN] PSK read error ({mesh_name}): {exc}")
+                warn(f"  PSK read error ({mesh_name}): {exc}")
             break
 
     mesh_cache[mesh_name] = None
@@ -183,7 +183,7 @@ def get_raw_psk(mesh_name: str, meshes_dir: str):
             _psk_raw_cache[mesh_name] = (verts, tris)
             return _psk_raw_cache[mesh_name]
         except Exception as exc:
-            warn(f"  [WARN] PSK raw read error ({mesh_name}): {exc}")
+            warn(f"  PSK raw read error ({mesh_name}): {exc}")
         break
 
     _psk_raw_cache[mesh_name] = None

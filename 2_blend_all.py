@@ -139,7 +139,7 @@ def main() -> int:
         for name in map_names:
             json_path = JSON_DIR / f"{name}.json"
             if not json_path.exists():
-                tui.error(f"ERROR: JSON not found: {json_path}")
+                tui.error(f"JSON not found: {json_path}")
                 errors.append(name)
                 tui.advance()
                 continue
@@ -148,7 +148,7 @@ def main() -> int:
             try:
                 Map(str(json_path), str(EXPORT_DIR)).blend(terrain=terrain)
             except Exception as exc:
-                tui.error(f"ERROR while processing {name}: {exc}")
+                tui.error(f"while processing {name}: {exc}")
                 errors.append(name)
             tui.advance()
 

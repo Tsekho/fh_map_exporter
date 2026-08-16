@@ -743,7 +743,7 @@ def bake_spline_layer(
         )
         return True
     except Exception as exc:
-        warn(f"  [WARN] {label} bake failed: {exc}")
+        warn(f"  {label} bake failed: {exc}")
         return False
     finally:
         for o, z in prev_z:

@@ -306,7 +306,7 @@ def place_spline_mesh(
     try:
         world_ue = _deform_spline_verts(verts_ue, entry)
     except Exception as exc:
-        warn(f"  [WARN] Spline deform failed ({mesh_name}): {exc}")
+        warn(f"  Spline deform failed ({mesh_name}): {exc}")
         return None
 
     verts_bl = np.empty_like(world_ue)

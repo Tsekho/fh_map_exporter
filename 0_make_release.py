@@ -39,12 +39,12 @@ def main() -> int:
         ])
 
         if rc != 0:
-            tui.error(f"ERROR: dotnet publish failed (exit code {rc})")
+            tui.error(f"dotnet publish failed (exit code {rc})")
             return rc
 
         published = EXPORTER_PUBLISH_DIR / "Exporter.exe"
         if not published.exists():
-            tui.error(f"ERROR: expected output not found: {published}")
+            tui.error(f"expected output not found: {published}")
             return 1
 
         shutil.copy2(published, EXPORTER_EXE)

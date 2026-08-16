@@ -96,7 +96,7 @@ def _load_region_water_dist(region_name: str) -> Optional[np.ndarray]:
         hw = cv2.imread(
             str(HM_WATER_DIR / f"{region_name}.png"), cv2.IMREAD_UNCHANGED)
         if hl is None or hw is None:
-            tui_warn("  [WARN] bridges_aim: heightmap bake(s) missing; "
+            tui_warn("  bridges_aim: heightmap bake(s) missing; "
                      "navigability depth gate skipped")
         else:
             depth_cm = hw.astype(np.int32) - hl.astype(np.int32)
@@ -263,7 +263,7 @@ def render_one(
             if not render_svg_layers(region_name):
                 ok = False
         except Exception as exc:
-            tui_warn(f"  [WARN] SVG layer render failed: {exc}")
+            tui_warn(f"  SVG layer render failed: {exc}")
             ok = False
 
     bpy.ops.wm.open_mainfile(filepath=str(blend_path))
@@ -285,7 +285,7 @@ def render_one(
 
     objs = _collect_focus_objects(region_name)
     if objs is None:
-        tui_warn(f"  [WARN] root collection '{region_name}' not found; skipped")
+        tui_warn(f"  root collection '{region_name}' not found; skipped")
         return False
 
     spill_cats = _spill_categories(objs)
@@ -349,7 +349,7 @@ def render_one(
                 occluders=objs["deep_water"],
             )
         except Exception as exc:
-            tui_warn(f"  [WARN] heightmap bake failed: {exc}")
+            tui_warn(f"  heightmap bake failed: {exc}")
             ok = False
 
         try:
@@ -364,7 +364,7 @@ def render_one(
                 occluders=objs["deep_water"],
             )
         except Exception as exc:
-            tui_warn(f"  [WARN] heightmap_water bake failed: {exc}")
+            tui_warn(f"  heightmap_water bake failed: {exc}")
             ok = False
 
     if do_id:
@@ -405,7 +405,7 @@ def render_one(
                 samples_per_side=ID_SSAA,
             )
         except Exception as exc:
-            tui_warn(f"  [WARN] ID coverage bake failed: {exc}")
+            tui_warn(f"  ID coverage bake failed: {exc}")
             ok = False
 
     if do_ao:
@@ -444,7 +444,7 @@ def render_one(
                         if hasattr(o, f"visible_{k}"):
                             setattr(o, f"visible_{k}", v)
         except Exception as exc:
-            tui_warn(f"  [WARN] AO bake failed: {exc}")
+            tui_warn(f"  AO bake failed: {exc}")
             ok = False
 
     def _run_spline_layer(out_dir: Path, target_cats: tuple, label: str,
@@ -512,7 +512,7 @@ def render_one(
             roads_img = cv2.imread(str(roads_path), cv2.IMREAD_UNCHANGED)
             if (roads_img is None or roads_img.ndim != 3
                     or roads_img.shape[2] != 4):
-                tui_warn("  [WARN] roads blur skipped "
+                tui_warn("  roads blur skipped "
                          "(unreadable or non-RGBA output)")
             else:
                 bgr = roads_img[..., :3].astype(np.float32)
@@ -538,7 +538,7 @@ def render_one(
             terrain_path = ID_DIR / "terrain" / f"{region_name}.png"
             water_path = ID_DIR / "water" / f"{region_name}.png"
             if not (terrain_path.is_file() and water_path.is_file()):
-                tui_warn("  [WARN] beaches land-mask skipped "
+                tui_warn("  beaches land-mask skipped "
                          "(missing per-region terrain/water ID PNG)")
             else:
                 beach_img = cv2.imread(str(beach_path), cv2.IMREAD_UNCHANGED)
@@ -549,7 +549,7 @@ def render_one(
                 if (beach_img is None or terrain_cov is None
                         or water_cov is None or beach_img.ndim != 3
                         or beach_img.shape[2] != 4):
-                    tui_warn("  [WARN] beaches land-mask skipped "
+                    tui_warn("  beaches land-mask skipped "
                              "(unreadable or non-RGBA inputs)")
                 else:
                     non_water = (255 - water_cov).astype(np.uint16)
@@ -611,7 +611,7 @@ def render_one(
                     skip_teardown=True,
                 )
             except Exception as exc:
-                tui_warn(f"  [WARN] split layers bake failed: {exc}")
+                tui_warn(f"  split layers bake failed: {exc}")
                 ok = False
 
     if do_svg:
@@ -626,7 +626,7 @@ def render_one(
             if not render_bridges_aim_layer(region_name, water_dist):
                 ok = False
         except Exception as exc:
-            tui_warn(f"  [WARN] bridges_aim render failed: {exc}")
+            tui_warn(f"  bridges_aim render failed: {exc}")
             ok = False
 
     return ok
@@ -845,7 +845,7 @@ def main() -> int:
                                   region_idx=region_idx, region_total=total):
                     failed.append(blend.stem)
             except Exception as exc:
-                tui.error(f"ERROR while rendering {blend.stem}: {exc}")
+                tui.error(f"while rendering {blend.stem}: {exc}")
                 failed.append(blend.stem)
             tui.advance()
 

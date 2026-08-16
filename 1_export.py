@@ -26,13 +26,13 @@ def main() -> int:
                 [str(EXPORTER_EXE), "-i", str(FOXHOLE_PAK), "-o", str(EXPORT_DIR), "-t"]
             )
         if result.returncode != 0:
-            tui.error(f"ERROR: Exporter.exe failed (exit code {result.returncode})")
+            tui.error(f"Exporter.exe failed (exit code {result.returncode})")
             return result.returncode
         tui.advance()
 
         json_path = JSON_DIR / "HomeRegionW.json"
         if not json_path.exists():
-            tui.error(f"ERROR: JSON not found: {json_path}")
+            tui.error(f"JSON not found: {json_path}")
             return 1
 
         data = json.loads(json_path.read_text(encoding="utf-8"))
@@ -76,9 +76,9 @@ def main() -> int:
                 tui.log(f"    + {name}")
         else:
             if not CATALOGUE_FILE.exists():
-                tui.warn(f"WARN: catalogue not found: {CATALOGUE_FILE}")
+                tui.warn(f"catalogue not found: {CATALOGUE_FILE}")
             if not MESHES_DIR.exists():
-                tui.warn(f"WARN: meshes dir not found: {MESHES_DIR}")
+                tui.warn(f"meshes dir not found: {MESHES_DIR}")
 
     return 0
 

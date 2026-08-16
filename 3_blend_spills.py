@@ -167,7 +167,7 @@ def main() -> int:
                     json_name_map=json_name_map,
                 )
             except Exception as exc:
-                tui.error(f"ERROR while processing {name}: {exc}")
+                tui.error(f"while processing {name}: {exc}")
                 errors.append(name)
             tui.advance()
 

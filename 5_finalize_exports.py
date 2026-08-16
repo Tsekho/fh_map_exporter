@@ -209,7 +209,7 @@ def stitch(
 
         tile = cv2.imread(str(tile_path), read_flag)
         if tile is None:
-            tui_warn(f"  [WARN] unreadable tile: {tile_path}")
+            tui_warn(f"  unreadable tile: {tile_path}")
             continue
 
         if channels == 1 and tile.ndim == 3:
@@ -247,7 +247,7 @@ def stitch_heightmap_landscape(
     width: int,
 ) -> np.ndarray | None:
     if not HM_LANDSCAPE_DIR.is_dir():
-        tui_warn(f"  [WARN] {HM_LANDSCAPE_DIR} not found; "
+        tui_warn(f"  {HM_LANDSCAPE_DIR} not found; "
                  f"skipping landscape heightmap products")
         return None
     tui_log("\n=== stitching heightmap_landscape ===")
@@ -293,7 +293,7 @@ def build_fly_alert(
         ).astype(np.uint8)
     pattern = cv2.imread(str(FLY_ALERT_PATTERN_FILE), cv2.IMREAD_UNCHANGED)
     if pattern is None:
-        tui_warn(f"  [WARN] {FLY_ALERT_PATTERN_FILE} not found; "
+        tui_warn(f"  {FLY_ALERT_PATTERN_FILE} not found; "
                  f"falling back to solid white fly_alert")
         fly_rgba = np.zeros((height, width, 4), dtype=np.uint8)
         fly_rgba[..., 0:3] = 255
@@ -347,7 +347,7 @@ def stitch_heightmap_water(
     width: int,
 ) -> np.ndarray | None:
     if not HM_WATER_DIR.is_dir():
-        tui_warn(f"  [WARN] {HM_WATER_DIR} not found; skipping heightmap_simple")
+        tui_warn(f"  {HM_WATER_DIR} not found; skipping heightmap_simple")
         return None
     tui_log("\n=== stitching heightmap_water ===")
     hm_map = _build_tile_map(HM_WATER_DIR)
@@ -523,7 +523,7 @@ def build_shades(
     alpha-betting into an RGB canvas. Returns (shades_bgr, shades_alpha)
     or None when LAYERS_DIR is missing / empty."""
     if not LAYERS_DIR.is_dir():
-        tui_warn(f"[WARN] {LAYERS_DIR} not found; no per-layer stitching done")
+        tui_warn(f"{LAYERS_DIR} not found; no per-layer stitching done")
         return None
     layer_dirs = sorted(d for d in LAYERS_DIR.iterdir() if d.is_dir())
     if not layer_dirs:
@@ -623,7 +623,7 @@ def build_base_layer(
       + ao                      (multiply)
     """
     if terrain_recolor is None:
-        tui_warn("  [WARN] terrain_recolor unavailable; skipping base_layer")
+        tui_warn("  terrain_recolor unavailable; skipping base_layer")
         return
 
     height, width = world_alpha.shape
@@ -704,7 +704,7 @@ def build_rdz(height: int, width: int, out_path: Path) -> None:
     """rdz_pattern with svg_layers/rdz_grace punching holes in its alpha."""
     pattern = cv2.imread(str(RDZ_PATTERN_FILE), cv2.IMREAD_UNCHANGED)
     if pattern is None:
-        tui_warn(f"  [WARN] {RDZ_PATTERN_FILE} not found; skipping rdz")
+        tui_warn(f"  {RDZ_PATTERN_FILE} not found; skipping rdz")
         return
     if pattern.ndim == 2:
         pattern = cv2.cvtColor(pattern, cv2.COLOR_GRAY2BGRA)
@@ -753,7 +753,7 @@ def build_ranges(
         result = _composite_over(result, img)
         any_hit = True
     if not any_hit:
-        tui_warn("  [WARN] no range svg_layers available; skipping ranges")
+        tui_warn("  no range svg_layers available; skipping ranges")
         return
     _write_rgba(result, out_path)
     _saved(out_path)
@@ -845,7 +845,7 @@ def _stitch_id_coverage(
 ) -> Dict[str, np.ndarray]:
     id_coverage: Dict[str, np.ndarray] = {}
     if not ID_DIR.is_dir():
-        tui_warn(f"\n[WARN] {ID_DIR} not found; per-category ID coverage skipped")
+        tui_warn(f"\n{ID_DIR} not found; per-category ID coverage skipped")
         return id_coverage
 
     cat_dirs = sorted(d for d in ID_DIR.iterdir() if d.is_dir())
@@ -908,7 +908,7 @@ def _run(
             out_rel=f"{ASSEMBLY_DIR}/bridges_aim.png",
         )
     else:
-        tui_warn(f"\n[WARN] {BRIDGES_AIM_DIR} not found; "
+        tui_warn(f"\n{BRIDGES_AIM_DIR} not found; "
                  f"skipping bridges_aim stitching")
 
     # -- split_layers/<layer>.png (unchanged location) --
@@ -922,7 +922,7 @@ def _run(
                 out_rel=f"split_layers/{layer}.png",
             )
     else:
-        tui_warn(f"\n[WARN] {SPLIT_LAYERS_DIR} not found; "
+        tui_warn(f"\n{SPLIT_LAYERS_DIR} not found; "
                  f"skipping split_layer stitching")
 
     # -- svg_layers/<layer>.png (unchanged location; consumed below) --
@@ -936,7 +936,7 @@ def _run(
                 out_rel=f"svg_layers/{layer}.png",
             )
     else:
-        tui_warn(f"\n[WARN] {SVG_LAYERS_DIR} not found; "
+        tui_warn(f"\n{SVG_LAYERS_DIR} not found; "
                  f"skipping svg_layer stitching")
 
     id_coverage = _stitch_id_coverage(centres, mask, height, width, world_alpha)
@@ -999,7 +999,7 @@ def _run(
             FINAL_DIR / ASSEMBLY_DIR / "dive_alert.png",
         )
     else:
-        tui_warn("  [WARN] missing heightmap/water coverage; skipping dive_alert")
+        tui_warn("  missing heightmap/water coverage; skipping dive_alert")
 
     del raw_landscape, raw_water
 

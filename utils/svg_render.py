@@ -191,7 +191,7 @@ def render_svg_layers(region_name: str) -> bool:
 
     json_path = JSON_DIR / f"{region_name}.json"
     if not json_path.is_file():
-        warn(f"  [WARN] SVG layers: no JSON at {json_path}; skipped")
+        warn(f"  SVG layers: no JSON at {json_path}; skipped")
         return False
 
     with json_path.open("r", encoding="utf-8") as f:
@@ -216,7 +216,7 @@ def render_svg_layers(region_name: str) -> bool:
                 output_height=TILE_SIZE,
             )
         except Exception as exc:
-            warn(f"  [WARN] svg layer '{layer}' rasterize failed: {exc}")
+            warn(f"  svg layer '{layer}' rasterize failed: {exc}")
             continue
         log(f"    [{i:>{w}}/{total_layers}] {layer}: "
               f"{n} placement(s) -> {out_path.name}")
@@ -936,7 +936,7 @@ def render_bridges_aim_layer(
 
     json_path = JSON_DIR / f"{region_name}.json"
     if not json_path.is_file():
-        warn(f"  [WARN] bridges_aim: no JSON at {json_path}; skipped")
+        warn(f"  bridges_aim: no JSON at {json_path}; skipped")
         return False
     with json_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -965,7 +965,7 @@ def render_bridges_aim_layer(
             output_height=TILE_SIZE,
         )
     except Exception as exc:
-        warn(f"  [WARN] bridges_aim rasterize failed: {exc}")
+        warn(f"  bridges_aim rasterize failed: {exc}")
         return False
 
     n_pairs = len(pairs) if sockets else 0
