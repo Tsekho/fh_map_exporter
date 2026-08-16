@@ -432,18 +432,34 @@ def _get_instancer_template(
 
 
 def _set_modifier_object_input(mod, obj) -> None:
-    """Modifier inputs keyed by socket identifier - differs between 3.x / 4.x."""
+    """Modifier inputs keyed by socket identifier - differs between 3.x / 4.x / 5.x.
+
+    3.x/4.x store inputs as ID properties (``mod[identifier] = obj``). 5.0+
+    replaced that with real RNA properties under ``mod.properties.inputs``;
+    assigning an Object through the old ID-property syntax there raises
+    "id properties not supported for this type".
+    """
     ng = mod.node_group
+    identifier = None
     if hasattr(ng, "interface"):
         for item in ng.interface.items_tree:
             if (getattr(item, "in_out", None) == 'INPUT'
                     and getattr(item, "socket_type", None) == 'NodeSocketObject'):
-                mod[item.identifier] = obj
-                return
-    for s in ng.inputs:
-        if s.type == 'OBJECT':
-            mod[s.identifier] = obj
-            return
+                identifier = item.identifier
+                break
+    else:
+        for s in ng.inputs:
+            if s.type == 'OBJECT':
+                identifier = s.identifier
+                break
+    if identifier is None:
+        return
+
+    inputs = getattr(getattr(mod, "properties", None), "inputs", None)
+    if inputs is not None:
+        getattr(inputs, identifier).value = obj
+    else:
+        mod[identifier] = obj
 
 
 def place_instanced(
