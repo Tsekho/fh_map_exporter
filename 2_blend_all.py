@@ -13,6 +13,7 @@ from typing import List, Optional, Set
 from utils.config import CENTRES_FILE, EXPORT_DIR, JSON_DIR, NUM_WORKERS
 from utils.map import Map
 from utils.parallel import run_parallel_subprocesses
+from utils.prompt import is_interactive, select
 from utils.tui import ScriptTUI
 
 
@@ -38,16 +39,7 @@ def _list_maps() -> List[str]:
     )
 
 
-def pick_map_interactive() -> Optional[List[str]]:
-    if not JSON_DIR.is_dir():
-        print(f"ERROR: {JSON_DIR} not found")
-        return None
-
-    maps = _list_maps()
-    if not maps:
-        print(f"ERROR: no JSON files found in {JSON_DIR}")
-        return None
-
+def _pick_map_fallback(maps: List[str]) -> Optional[List[str]]:
     print("Available maps:")
     print("    0. All maps")
     for i, name in enumerate(maps, 1):
@@ -64,6 +56,25 @@ def pick_map_interactive() -> Optional[List[str]]:
         elif raw in maps:
             return [raw]
         print("  Invalid selection, try again.")
+
+
+def pick_map_interactive() -> Optional[List[str]]:
+    if not JSON_DIR.is_dir():
+        print(f"ERROR: {JSON_DIR} not found")
+        return None
+
+    maps = _list_maps()
+    if not maps:
+        print(f"ERROR: no JSON files found in {JSON_DIR}")
+        return None
+
+    if not is_interactive():
+        return _pick_map_fallback(maps)
+
+    idx = select("Select map", ["All maps"] + maps)
+    if idx is None:
+        return None
+    return maps if idx == 0 else [maps[idx - 1]]
 
 
 def main() -> int:

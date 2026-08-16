@@ -64,6 +64,7 @@ from utils.bake import (
     render_split_layers_ao,
 )
 from utils.parallel import run_parallel_subprocesses
+from utils.prompt import is_interactive, multiselect, select
 from utils.svg_render import render_bridges_aim_layer, render_svg_layers
 from utils.tui import ScriptTUI
 from utils.tui import log as tui_log
@@ -637,8 +638,7 @@ def _list_blends() -> List[Path]:
     return sorted(SPILL_DIR.glob("*.blend"))
 
 
-def pick_region_interactive(blends: List[Path]) -> Optional[List[Path]]:
-    names = [p.stem for p in blends]
+def _pick_region_fallback(blends: List[Path], names: List[str]) -> Optional[List[Path]]:
     print("Available .blend spills:")
     print("    0. All regions")
     for i, name in enumerate(names, 1):
@@ -656,17 +656,32 @@ def pick_region_interactive(blends: List[Path]) -> Optional[List[Path]]:
         print("  Invalid selection, try again.")
 
 
-def ask_bakes() -> Tuple[bool, bool, bool, bool, bool, bool, bool]:
-    print(
-        "Bakes:\n"
-        "  svg -> svg_layers/<layer> + bridges_aim\n"
-        "  ao  -> ao\n"
-        "  hm  -> heightmap_landscape + heightmap_water\n"
-        "  id  -> id/<category> (incl. id/water)\n"
-        "  r   -> roads\n"
-        "  b   -> beaches\n"
-        "  sl  -> split_layers/<layer>"
-    )
+def pick_region_interactive(blends: List[Path]) -> Optional[List[Path]]:
+    names = [p.stem for p in blends]
+
+    if not is_interactive():
+        return _pick_region_fallback(blends, names)
+
+    idx = select("Select region", ["All regions"] + names)
+    if idx is None:
+        return None
+    return blends if idx == 0 else [blends[idx - 1]]
+
+
+_BAKE_TOKENS = ("svg", "ao", "hm", "id", "r", "b", "sl")
+_BAKE_LABELS = (
+    "svg  -> svg_layers/<layer> + bridges_aim",
+    "ao   -> ao",
+    "hm   -> heightmap_landscape + heightmap_water",
+    "id   -> id/<category> (incl. id/water)",
+    "r    -> roads",
+    "b    -> beaches",
+    "sl   -> split_layers/<layer>",
+)
+
+
+def _ask_bakes_fallback() -> Tuple[bool, bool, bool, bool, bool, bool, bool]:
+    print("Bakes:\n  " + "\n  ".join(_BAKE_LABELS))
     while True:
         raw = input(
             "Select bakes (space-separated from: svg ao hm id r b sl; "
@@ -675,15 +690,23 @@ def ask_bakes() -> Tuple[bool, bool, bool, bool, bool, bool, bool]:
         if raw == "":
             return True, True, True, True, True, True, True
         tokens = raw.replace(",", " ").split()
-        valid = {"svg", "ao", "hm", "id", "r", "b", "sl"}
+        valid = set(_BAKE_TOKENS)
         if any(t not in valid for t in tokens):
             print("  Invalid token, try again.")
             continue
-        return (
-            "svg" in tokens,
-            "ao" in tokens, "hm" in tokens, "id" in tokens,
-            "r" in tokens, "b" in tokens, "sl" in tokens,
-        )
+        return tuple(t in tokens for t in _BAKE_TOKENS)
+
+
+def ask_bakes() -> Tuple[bool, bool, bool, bool, bool, bool, bool]:
+    if not is_interactive():
+        return _ask_bakes_fallback()
+
+    checked = multiselect(
+        "Select bakes", list(_BAKE_LABELS), checked=set(range(len(_BAKE_TOKENS))),
+    )
+    if checked is None:
+        raise KeyboardInterrupt
+    return tuple(i in checked for i in range(len(_BAKE_TOKENS)))
 
 
 def main() -> int:

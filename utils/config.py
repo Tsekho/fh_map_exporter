@@ -99,6 +99,17 @@ TUI_BAR_WIDTH = 30
 TUI_TICK_INTERVAL_S = 1.0
 
 
+# ------------------------------------------------------------------------------
+#  Shared prompt menus (utils/prompt.py)
+# ------------------------------------------------------------------------------
+
+# Maximum number of option rows shown at once in select()/multiselect()
+# menus; longer lists scroll to keep the highlighted row in view. Also
+# capped by the terminal's actual height at render time, so this is a
+# ceiling, not a guarantee.
+PROMPT_MAX_VISIBLE_OPTIONS = 10
+
+
 FOXHOLE_PAK = Path(
     r"C:\Program Files (x86)\Steam\steamapps\common"
     r"\Foxhole\War\Content\Paks\War-WindowsNoEditor.pak"
