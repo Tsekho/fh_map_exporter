@@ -19,6 +19,17 @@ def main() -> int:
         print(f"ERROR: Exporter.exe not found: {EXPORTER_EXE}")
         return 1
 
+    if FOXHOLE_PAK is None:
+        print(
+            "ERROR: could not locate War-WindowsNoEditor.pak.\n"
+            "  Searched every Steam library folder; Foxhole doesn't seem "
+            "to be installed in any of them.\n"
+            "  If it's installed somewhere unusual, set the "
+            "FOXHOLE_PAK_PATH environment variable to the full path of "
+            "War-WindowsNoEditor.pak and try again."
+        )
+        return 1
+
     result = subprocess.run(
         [str(EXPORTER_EXE), "-i", str(FOXHOLE_PAK), "-o", str(EXPORT_DIR), "-t"]
     )
