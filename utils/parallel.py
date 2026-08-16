@@ -12,6 +12,7 @@ the script uses.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import threading
@@ -20,6 +21,17 @@ from typing import Callable, List, Sequence
 
 from utils.config import REPO_ROOT
 from utils.tui import ScriptTUI, strip_tag
+
+# On Windows, a child spawned via subprocess.Popen shares the parent's
+# console window unless told otherwise. Our own stdout/stderr redirection
+# (below) captures everything the child writes through Python, but native
+# code inside bpy/Blender can call the Win32 console API directly, which
+# writes straight to that shared console handle -- bypassing the pipe
+# *and* the parent ScriptTUI's lock entirely, corrupting the parent's
+# display with no relation to our own write sequencing. Giving each child
+# its own (hidden) console via CREATE_NO_WINDOW isolates any such direct
+# writes away from the parent's terminal.
+_POPEN_KWARGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 
 # Match any absolute path that starts with REPO_ROOT (both "\" and "/"
@@ -114,6 +126,7 @@ def run_parallel_subprocesses(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **_POPEN_KWARGS,
         )
         thread = threading.Thread(
             target=_pump, args=(label, proc, tui), daemon=True,

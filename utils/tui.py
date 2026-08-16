@@ -379,6 +379,17 @@ class ScriptTUI:
                 self._stream.write(tagged + "\n")
                 self._stream.flush()
                 return
+            # Clear the bar off the current row, write the new log content,
+            # then redraw the bar fresh on whatever row the cursor lands
+            # on. This deliberately never moves the cursor *up* -- only
+            # "\r" + clear on the row we're already on, then natural "\n"
+            # scrolling for everything else -- so it stays correct even
+            # when a line is longer than the terminal width and the
+            # terminal auto-wraps it onto extra visual rows; the terminal
+            # itself accounts for that when it processes "\n", but a
+            # fixed cursor-up-N-rows guess (an earlier version of this
+            # code did that, to keep a blank line pinned above the bar)
+            # can't, and ends up clobbering the wrong row.
             self._stream.write("\r" + _CLEAR_LINE)
             for line in tagged.split("\n"):
                 self._stream.write(line + "\n")
