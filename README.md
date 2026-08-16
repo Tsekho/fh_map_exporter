@@ -86,6 +86,11 @@ Clears `export/` and runs `Exporter.exe`. Writes:
 python 1_export.py
 ```
 
+`War-WindowsNoEditor.pak` is located automatically by searching every Steam
+library folder (any drive) for a Foxhole install. If that fails, or Foxhole
+is installed somewhere unusual, set the `FOXHOLE_PAK_PATH` environment
+variable to the full path of the `.pak` file.
+
 ### Step 2 - Generate Blender Scenes
 
 ```bash

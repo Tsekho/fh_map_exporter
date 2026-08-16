@@ -9,7 +9,9 @@ what the current working directory is when it runs.
 """
 
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
+
+from utils.foxhole_locator import find_foxhole_pak
 
 
 # ------------------------------------------------------------------------------
@@ -86,10 +88,11 @@ NUM_WORKERS = 6
 NUM_WORKERS_SPILLS = 3
 
 
-FOXHOLE_PAK = Path(
-    r"C:\Program Files (x86)\Steam\steamapps\common"
-    r"\Foxhole\War\Content\Paks\War-WindowsNoEditor.pak"
-)
+# Auto-detected from the Steam registry + libraryfolders.vdf (any library,
+# any drive) -- see utils/foxhole_locator.py. None if it couldn't be found;
+# 1_export.py is responsible for reporting that to the user. Override with
+# the FOXHOLE_PAK_PATH environment variable for non-Steam/unusual installs.
+FOXHOLE_PAK: Optional[Path] = find_foxhole_pak()
 
 
 # ------------------------------------------------------------------------------
