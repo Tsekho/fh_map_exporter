@@ -32,6 +32,8 @@ The amazing idea of thresholded water depth coloring was adopted from
 - [.NET 10 SDK](https://dotnet.microsoft.com/download) (step 0 only)
 - Cairo (the easiest way to install it - [GTK for Windows Runtime Environment](https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer))
 ```bash
+pip install -r requirements.txt
+# or
 pip install numpy opencv-python bpy cairosvg
 ```
 
