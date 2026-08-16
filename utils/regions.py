@@ -19,6 +19,7 @@ from utils.config import (
 )
 from utils.map import Map
 from utils.psk import clear_caches, mesh_cache
+from utils.tui import error, log, warn
 
 
 REGION_UNIT_TO_METER = 1890.0 / 1776.0
@@ -133,7 +134,7 @@ def spawn_deep_water_tree(
             _clone(child)
 
     _clone(water_root)
-    print(f"  Deep water: {len(clones)} clone(s) placed {depth:.0f} m below")
+    log(f"  Deep water: {len(clones)} clone(s) placed {depth:.0f} m below")
     return clones
 
 
@@ -169,7 +170,7 @@ def spawn_deep_water(
         clone.material_slots[0].material = black_mat
         placed += 1
 
-    print(f"  Deep water: {placed} clone(s) placed {depth:.0f} m below")
+    log(f"  Deep water: {placed} clone(s) placed {depth:.0f} m below")
     return placed
 
 
@@ -210,8 +211,8 @@ def build_region_with_spill(
         if c not in CATEGORY_COLORS
     ]
     if missing_color:
-        print(f"  [WARN] No CATEGORY_COLORS entry for: "
-              f"{', '.join(missing_color)} - those categories will be skipped")
+        warn(f"  [WARN] No CATEGORY_COLORS entry for: "
+             f"{', '.join(missing_color)} - those categories will be skipped")
     spill_categories = [c for c in spill_categories if c in CATEGORY_COLORS]
 
     allowed_neighbor_meshes = _build_category_lookup(
@@ -235,15 +236,15 @@ def build_region_with_spill(
     own_name = json_name_map[region_key]
     own_json = os.path.join(export_dir, "_json", f"{own_name}.json")
     if not os.path.exists(own_json):
-        print(f"ERROR: JSON not found: {own_json}")
+        error(f"ERROR: JSON not found: {own_json}")
         return
 
     own_center = region_center_to_blender(region_centers[region_key])
     neighbors = find_region_neighbors(region_centers, region_key)
 
-    print(f"=== {own_name} (spill) ===")
-    print(f"  Center (Blender m): ({own_center[0]:.1f}, {own_center[1]:.1f})")
-    print(f"  Neighbors ({len(neighbors)}): "
+    log(f"=== {own_name} (spill) ===")
+    log(f"  Center (Blender m): ({own_center[0]:.1f}, {own_center[1]:.1f})")
+    log(f"  Neighbors ({len(neighbors)}): "
           f"{', '.join(json_name_map.get(n, n) for n in neighbors) or 'none'}")
 
     focus_include = sorted(allowed_neighbor_meshes | water_meshes)
@@ -265,7 +266,7 @@ def build_region_with_spill(
 
     terrain_mat = make_color_material(CATEGORY_COLORS["terrain"])
     if os.path.exists(own_map.heightmap_path):
-        print("[terrain] Building focus terrain ...")
+        log("[terrain] Building focus terrain ...")
         t_coll = bpy.data.collections.new("terrain")
         root.children.link(t_coll)
         create_terrain(
@@ -273,7 +274,7 @@ def build_region_with_spill(
             stride=terrain_stride, material=terrain_mat,
         )
     else:
-        print(f"[terrain] Missing heightmap: {short_path(own_map.heightmap_path)}")
+        log(f"[terrain] Missing heightmap: {short_path(own_map.heightmap_path)}")
 
     focus_category_objs: Dict[str, List[bpy.types.Object]] = {}
     total += own_map._populate_by_category(
@@ -346,7 +347,7 @@ def build_region_with_spill(
 
     focus_self_removed, focus_buckets = _dedup_within_source(focus_category_objs)
     if focus_self_removed:
-        print(f"  dedup (focus self): {focus_self_removed} "
+        log(f"  dedup (focus self): {focus_self_removed} "
               f"duplicate placement(s) removed")
 
     _cross_tol_sq = CROSS_DEDUP_XY_TOL * CROSS_DEDUP_XY_TOL
@@ -362,17 +363,17 @@ def build_region_with_spill(
     for neigh_key in neighbors:
         neigh_name = json_name_map.get(neigh_key)
         if neigh_name is None:
-            print(f"  [WARN] No JSON for neighbor '{neigh_key}', skipped")
+            warn(f"  [WARN] No JSON for neighbor '{neigh_key}', skipped")
             continue
         neigh_json = os.path.join(export_dir, "_json", f"{neigh_name}.json")
         if not os.path.exists(neigh_json):
-            print(f"  [WARN] Missing neighbor JSON: {neigh_json}")
+            warn(f"  [WARN] Missing neighbor JSON: {neigh_json}")
             continue
 
         neigh_center = region_center_to_blender(region_centers[neigh_key])
         shift = (neigh_center[0] - own_center[0],
                  neigh_center[1] - own_center[1], 0.0)
-        print(f"[neighbor] {neigh_name}  "
+        log(f"[neighbor] {neigh_name}  "
               f"shift=({shift[0]:+.1f}, {shift[1]:+.1f}) m")
 
         neigh_root = bpy.data.collections.new(neigh_name)
@@ -422,10 +423,10 @@ def build_region_with_spill(
         removed = self_removed + cross_removed
         placed_n -= removed
         if removed:
-            print(f"  placed {placed_n:,} spill object(s) from {neigh_name} "
+            log(f"  placed {placed_n:,} spill object(s) from {neigh_name} "
                   f"({self_removed} self-dup, {cross_removed} focus-dup removed)")
         else:
-            print(f"  placed {placed_n:,} spill object(s) from {neigh_name}")
+            log(f"  placed {placed_n:,} spill object(s) from {neigh_name}")
         total += placed_n
 
     own_map._apply_palette()
@@ -474,7 +475,7 @@ def build_region_with_spill(
                 placed_splines += 1
 
         if placed_splines:
-            print(f"[splines] placed {placed_splines:,} spline object(s)")
+            log(f"[splines] placed {placed_splines:,} spline object(s)")
             total += placed_splines
 
     water_root: Optional[bpy.types.Collection] = None
@@ -487,7 +488,7 @@ def build_region_with_spill(
 
     loaded_ok = sum(1 for v in mesh_cache.values() if v is not None)
     loaded_err = sum(1 for v in mesh_cache.values() if v is None)
-    print(f"\n  Objects placed : {total:,}\n"
+    log(f"\n  Objects placed : {total:,}\n"
           f"  Unique meshes  : {loaded_ok} loaded, "
           f"{loaded_err} missing/errored")
 
@@ -496,6 +497,6 @@ def build_region_with_spill(
     out_path = os.path.abspath(os.path.join(out_dir, f"{own_name}.blend"))
     if os.path.exists(out_path):
         os.remove(out_path)
-    print(f"\nSaving -> {short_path(out_path)} ...")
+    log(f"\nSaving -> {short_path(out_path)} ...")
     bpy.ops.wm.save_as_mainfile(filepath=out_path, compress=True)
-    print("Done.\n")
+    log("Done.\n")

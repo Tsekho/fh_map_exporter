@@ -19,6 +19,7 @@ from utils.config import (
 )
 from utils.regions import build_region_with_spill
 from utils.parallel import run_parallel_subprocesses
+from utils.tui import ScriptTUI
 
 
 def load_json_name_map() -> Dict[str, str]:
@@ -116,49 +117,50 @@ def main() -> int:
         region_keys = picked
 
     parallel = len(region_keys) > 1 and NUM_WORKERS > 1
-    print(f"=== Building {len(region_keys)} region spill(s) "
-          f"(workers={NUM_WORKERS if parallel else 1}) ===")
-
-    if parallel:
-        def _cmd(key: str) -> List[str]:
-            name = json_name_map.get(key, key)
-            return [sys.executable, str(Path(__file__).resolve()), name]
-
-        failed = run_parallel_subprocesses(
-            region_keys, _cmd,
-            workers=NUM_WORKERS,
-            label_fn=lambda k: json_name_map.get(k, k),
-        )
-        if failed:
-            names = [json_name_map.get(k, k) for k in failed]
-            print(f"\n{len(failed)} region(s) failed: {', '.join(names)}")
-            return 1
-        print(f"\n=== SUCCESS ===")
-        return 0
-
-    errors: List[str] = []
     total = len(region_keys)
-    w = len(str(total))
-    for i, key in enumerate(region_keys, 1):
-        name = json_name_map.get(key, key)
-        print(f"\n=== [{i:>{w}}/{total}] {name} ===")
-        try:
-            build_region_with_spill(
-                region_key=key,
-                export_dir=str(EXPORT_DIR),
-                region_centers=region_centers,
-                catalogue=catalogue,
-                json_name_map=json_name_map,
+
+    with ScriptTUI(title=f"Building {total} region spill(s)", total=total) as tui:
+        if parallel:
+            def _cmd(key: str) -> List[str]:
+                name = json_name_map.get(key, key)
+                return [sys.executable, str(Path(__file__).resolve()), name]
+
+            failed = run_parallel_subprocesses(
+                region_keys, _cmd,
+                workers=NUM_WORKERS, tui=tui,
+                label_fn=lambda k: json_name_map.get(k, k),
             )
-        except Exception as exc:
-            print(f"ERROR while processing {name}: {exc}")
-            errors.append(name)
+            if failed:
+                names = [json_name_map.get(k, k) for k in failed]
+                tui.error(f"{len(failed)} region(s) failed: {', '.join(names)}")
+                return 1
+            tui.log("=== SUCCESS ===")
+            return 0
 
-    if errors:
-        print(f"\n{len(errors)} region(s) failed: {', '.join(errors)}")
-        return 1
+        errors: List[str] = []
+        for key in region_keys:
+            name = json_name_map.get(key, key)
+            tui.set_description(name)
+            tui.log(f"--- {name} ---")
+            try:
+                build_region_with_spill(
+                    region_key=key,
+                    export_dir=str(EXPORT_DIR),
+                    region_centers=region_centers,
+                    catalogue=catalogue,
+                    json_name_map=json_name_map,
+                )
+            except Exception as exc:
+                tui.error(f"ERROR while processing {name}: {exc}")
+                errors.append(name)
+            tui.advance()
 
-    print(f"\n=== SUCCESS ===")
+        if errors:
+            tui.error(f"{len(errors)} region(s) failed: {', '.join(errors)}")
+            return 1
+
+        tui.log("=== SUCCESS ===")
+
     return 0
 
 

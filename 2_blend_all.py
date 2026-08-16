@@ -13,6 +13,7 @@ from typing import List, Optional, Set
 from utils.config import CENTRES_FILE, EXPORT_DIR, JSON_DIR, NUM_WORKERS
 from utils.map import Map
 from utils.parallel import run_parallel_subprocesses
+from utils.tui import ScriptTUI
 
 
 def _load_region_keys() -> Set[str]:
@@ -103,44 +104,49 @@ def main() -> int:
         terrain = not args.no_terrain
 
     parallel = len(map_names) > 1 and NUM_WORKERS > 1
-    print(f"=== Building {len(map_names)} map(s) "
-          f"(terrain={terrain}, workers={NUM_WORKERS if parallel else 1}) ===")
-
-    if parallel:
-        def _cmd(name: str) -> List[str]:
-            argv = [sys.executable, str(Path(__file__).resolve()), name]
-            if not terrain:
-                argv.append("-nt")
-            return argv
-
-        failed = run_parallel_subprocesses(map_names, _cmd, workers=NUM_WORKERS)
-        if failed:
-            print(f"\n{len(failed)} map(s) failed: {', '.join(failed)}")
-            return 1
-        print(f"\n=== SUCCESS ===")
-        return 0
-
-    errors: List[str] = []
     total = len(map_names)
-    w = len(str(total))
-    for i, name in enumerate(map_names, 1):
-        json_path = JSON_DIR / f"{name}.json"
-        if not json_path.exists():
-            print(f"ERROR: JSON not found: {json_path}")
-            errors.append(name)
-            continue
-        print(f"\n=== [{i:>{w}}/{total}] {name} ===")
-        try:
-            Map(str(json_path), str(EXPORT_DIR)).blend(terrain=terrain)
-        except Exception as exc:
-            print(f"ERROR while processing {name}: {exc}")
-            errors.append(name)
+    title = f"Building {total} map(s) (terrain={terrain})"
 
-    if errors:
-        print(f"\n{len(errors)} map(s) failed: {', '.join(errors)}")
-        return 1
+    with ScriptTUI(title=title, total=total) as tui:
+        if parallel:
+            def _cmd(name: str) -> List[str]:
+                argv = [sys.executable, str(Path(__file__).resolve()), name]
+                if not terrain:
+                    argv.append("-nt")
+                return argv
 
-    print(f"\n=== SUCCESS ===")
+            failed = run_parallel_subprocesses(
+                map_names, _cmd, workers=NUM_WORKERS, tui=tui,
+            )
+            if failed:
+                tui.error(f"{len(failed)} map(s) failed: {', '.join(failed)}")
+                return 1
+            tui.log("=== SUCCESS ===")
+            return 0
+
+        errors: List[str] = []
+        for name in map_names:
+            json_path = JSON_DIR / f"{name}.json"
+            if not json_path.exists():
+                tui.error(f"ERROR: JSON not found: {json_path}")
+                errors.append(name)
+                tui.advance()
+                continue
+            tui.set_description(name)
+            tui.log(f"--- {name} ---")
+            try:
+                Map(str(json_path), str(EXPORT_DIR)).blend(terrain=terrain)
+            except Exception as exc:
+                tui.error(f"ERROR while processing {name}: {exc}")
+                errors.append(name)
+            tui.advance()
+
+        if errors:
+            tui.error(f"{len(errors)} map(s) failed: {', '.join(errors)}")
+            return 1
+
+        tui.log("=== SUCCESS ===")
+
     return 0
 
 

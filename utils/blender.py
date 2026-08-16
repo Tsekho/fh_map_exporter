@@ -10,6 +10,7 @@ from mathutils import Vector
 from utils.png import read_png16_gray
 from utils.psk import get_mesh, get_raw_psk
 from utils.config import short_path
+from utils.tui import log, warn
 
 
 # ------------------------------------------------------------------------------
@@ -114,9 +115,9 @@ def create_terrain(
     material: Optional[bpy.types.Material] = None,
 ) -> bpy.types.Object:
     """Build a grid mesh from a 16-bit PNG heightmap."""
-    print(f"  Loading heightmap: {short_path(heightmap_path)}")
+    log(f"  Loading heightmap: {short_path(heightmap_path)}")
     w, h, pixels = read_png16_gray(heightmap_path)
-    print(f"  Heightmap size: {w}x{h}")
+    log(f"  Heightmap size: {w}x{h}")
 
     cx, cy = w // 2, h // 2
     sub = pixels[::stride, ::stride]
@@ -195,7 +196,7 @@ def create_terrain(
     collection.objects.link(obj)
     obj.location = shift
 
-    print(f"  Terrain: {cols}x{rows} grid, {len(verts_np):,} verts, "
+    log(f"  Terrain: {cols}x{rows} grid, {len(verts_np):,} verts, "
           f"{keep.sum():,} faces, stride={stride}")
     return obj
 
@@ -305,7 +306,7 @@ def place_spline_mesh(
     try:
         world_ue = _deform_spline_verts(verts_ue, entry)
     except Exception as exc:
-        print(f"  [WARN] Spline deform failed ({mesh_name}): {exc}")
+        warn(f"  [WARN] Spline deform failed ({mesh_name}): {exc}")
         return None
 
     verts_bl = np.empty_like(world_ue)

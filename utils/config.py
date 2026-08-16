@@ -86,6 +86,19 @@ NUM_WORKERS = 6
 NUM_WORKERS_SPILLS = 3
 
 
+# ------------------------------------------------------------------------------
+#  Shared TUI (utils/tui.py)
+# ------------------------------------------------------------------------------
+
+# Width, in characters, of the "[####----]" fill portion of the bottom
+# progress bar (excludes the description/count/elapsed-time text).
+TUI_BAR_WIDTH = 30
+# Seconds between heartbeat redraws of the progress bar, so elapsed time
+# keeps ticking during long silent phases (e.g. a multi-minute bake with
+# no log/advance calls in between).
+TUI_TICK_INTERVAL_S = 1.0
+
+
 FOXHOLE_PAK = Path(
     r"C:\Program Files (x86)\Steam\steamapps\common"
     r"\Foxhole\War\Content\Paks\War-WindowsNoEditor.pak"

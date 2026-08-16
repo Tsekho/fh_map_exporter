@@ -24,6 +24,7 @@ from utils.config import (
     short_path,
 )
 from utils.png import write_png16_gray, write_png8_gray, write_png8_rgb, write_png8_rgba
+from utils.tui import log, warn
 
 
 BAKE_IMG_SIZE = 2048
@@ -74,7 +75,7 @@ def _restore_hide(prev: Dict[str, bool], key: str) -> None:
             setattr(o, key, v)
 
 
-def _rasterize_targets_footprint(
+def _rasterize_targets_footlog(
     target_objs: List[bpy.types.Object],
     size: int = BAKE_IMG_SIZE,
     margin_px: int = 4,
@@ -166,7 +167,7 @@ def _mask_restricted_to_targets(
 ) -> np.ndarray:
     """Return `mask` AND'd with a tight rasterized footprint of
     target_objs (triangles projected to XY, dilated by margin_px)."""
-    footprint = _rasterize_targets_footprint(
+    footprint = _rasterize_targets_footlog(
         target_objs, size=mask.shape[0], margin_px=margin_px,
     )
     out = mask & footprint
@@ -174,7 +175,7 @@ def _mask_restricted_to_targets(
         kept = int(out.sum())
         total = int(mask.sum())
         if total:
-            print(f"  [footprint] restricted bake area to "
+            log(f"  [footprint] restricted bake area to "
                   f"{kept}/{total} px ({100.0 * kept / total:.1f}%)")
     return out
 
@@ -287,7 +288,7 @@ def raycast_heightmap(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     write_png16_gray(output_path, out)
-    print(f"  Heightmap saved -> {short_path(output_path)}")
+    log(f"  Heightmap saved -> {short_path(output_path)}")
 
 
 def raycast_id_map(
@@ -342,7 +343,7 @@ def raycast_id_map(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     write_png8_rgb(output_path, out)
-    print(f"  ID map saved -> {short_path(output_path)}")
+    log(f"  ID map saved -> {short_path(output_path)}")
 
 
 def raycast_binary_mask(
@@ -391,7 +392,7 @@ def raycast_binary_mask(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     write_png8_rgb(output_path, out)
-    print(f"  Binary mask saved -> {short_path(output_path)}")
+    log(f"  Binary mask saved -> {short_path(output_path)}")
 
 
 def raycast_id_ssaa_per_category(
@@ -478,7 +479,7 @@ def raycast_id_ssaa_per_category(
         img = np.clip(img, 0, 255).astype(np.uint8)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         write_png8_gray(path, img)
-        print(f"  ID coverage [{cat}] saved -> {short_path(path)}  (SSAA {S}x{S})")
+        log(f"  ID coverage [{cat}] saved -> {short_path(path)}  (SSAA {S}x{S})")
 
 
 def raycast_split_layer_rgba(
@@ -587,7 +588,7 @@ def raycast_split_layer_rgba(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     write_png8_rgba(output_path, out)
-    print(f"  Split layer RGBA saved -> {short_path(output_path)}  (SSAA {S}x{S})")
+    log(f"  Split layer RGBA saved -> {short_path(output_path)}  (SSAA {S}x{S})")
 
 
 def raycast_coverage_rgba(
@@ -687,7 +688,7 @@ def raycast_coverage_rgba(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     write_png8_rgba(output_path, out)
-    print(f"  Coverage RGBA saved -> {short_path(output_path)}  (SSAA {S}x{S})")
+    log(f"  Coverage RGBA saved -> {short_path(output_path)}  (SSAA {S}x{S})")
 
 
 def bake_spline_layer(
@@ -721,7 +722,7 @@ def bake_spline_layer(
     True on success, False if the bake raised.
     """
     if not targets:
-        print(f"  [{label}] no source splines; writing empty image")
+        log(f"  [{label}] no source splines; writing empty image")
 
     full_occluders: List[bpy.types.Object] = list(occluders)
 
@@ -742,7 +743,7 @@ def bake_spline_layer(
         )
         return True
     except Exception as exc:
-        print(f"  [WARN] {label} bake failed: {exc}")
+        warn(f"  [WARN] {label} bake failed: {exc}")
         return False
     finally:
         for o, z in prev_z:
@@ -835,10 +836,10 @@ def _enable_cycles_gpu(scene) -> None:
                     pass
                 break
         if chosen is None:
-            print("  [info] no Cycles GPU backend available; using CPU")
+            log("  [info] no Cycles GPU backend available; using CPU")
         else:
             names = [d.name for d in prefs.get_devices_for_type(chosen) if d.use]
-            print(f"  [info] Cycles GPU backend: {chosen} ({', '.join(names)})")
+            log(f"  [info] Cycles GPU backend: {chosen} ({', '.join(names)})")
         _GPU_CONFIGURED = True
 
     try:
@@ -1045,7 +1046,7 @@ def render_ao(
 
     _apply_mask_to_image_file(output_path, mask)
     _clip_near_white(output_path, AO_NEAR_WHITE_CUTOFF)
-    print(f"  AO saved -> {short_path(output_path)}")
+    log(f"  AO saved -> {short_path(output_path)}")
 
 
 def _add_split_layer_edge_darken(nt, shade_socket):
@@ -1112,7 +1113,7 @@ def _build_rim_multiplier_png(
     with colorspace 'Non-Color' so the stored byte value is used as-is
     as a linear multiplier.
     """
-    footprint = _rasterize_targets_footprint(
+    footprint = _rasterize_targets_footlog(
         target_objs, size=size, margin_px=0,
     )
     if not footprint.any():
@@ -1350,7 +1351,7 @@ def render_split_layers_ao(
         rim_tmp_dir = tempfile.mkdtemp(prefix="fh_split_rim_")
 
     nn = time()
-    print(f"  [split-layers] setup in {nn - nnn:.2f}s "
+    log(f"  [split-layers] setup in {nn - nnn:.2f}s "
           f"({len(layers)} layer(s), {len(union_objs)} target mesh(es), "
           f"{len(other_meshes)} other mesh(es) hidden)")
     nnn = nn
@@ -1363,7 +1364,7 @@ def render_split_layers_ao(
             if announce is not None:
                 announce(label)
             else:
-                print(label)
+                log(label)
 
             # Stamp tints for this layer's groups. We overwrite color
             # unconditionally; it'll be restored globally at teardown.
@@ -1384,13 +1385,13 @@ def render_split_layers_ao(
                 o.hide_render = False
 
             try:
-                footprint = _rasterize_targets_footprint(
+                footprint = _rasterize_targets_footlog(
                     layer_target_objs, size=size, margin_px=16,
                 )
                 if not footprint.any():
                     blank = np.zeros((size, size, 4), dtype=np.uint8)
                     write_png8_rgba(output_path, blank)
-                    print(f"  [split-layer] empty footprint; wrote blank "
+                    log(f"  [split-layer] empty footprint; wrote blank "
                           f"-> {short_path(output_path)}")
                 else:
                     rows = np.where(footprint.any(axis=1))[0]
@@ -1403,7 +1404,7 @@ def render_split_layers_ao(
                     scene.render.border_max_y = 1.0 - i0 / size
                     tw, th = j1 - j0 + 1, i1 - i0 + 1
 
-                    print(f"  [split-layer] tile {tw}x{th} "
+                    log(f"  [split-layer] tile {tw}x{th} "
                           f"of {size}x{size} "
                           f"({100.0 * tw * th / (size * size):.2f}%) "
                           f"-> {short_path(output_path)}")
@@ -1462,7 +1463,7 @@ def render_split_layers_ao(
             _apply_mask_to_image_file(output_path, mask, preserve_alpha=True)
     finally:
         nn = time()
-        print(f"  [split-layers] all renders in {nn - nnn:.2f}s")
+        log(f"  [split-layers] all renders in {nn - nnn:.2f}s")
         nnn = nn
 
         if rim_tmp_dir is not None:
@@ -1473,7 +1474,7 @@ def render_split_layers_ao(
                 pass
 
         if skip_teardown:
-            print("  [split-layers] skipping teardown "
+            log("  [split-layers] skipping teardown "
                   "(process about to exit)")
         else:
             _restore_hide(prev_hidden, "hide_render")
@@ -1517,6 +1518,6 @@ def render_split_layers_ao(
                     pass
 
             nn = time()
-            print(f"  [split-layers] teardown in {nn - nnn:.2f}s")
+            log(f"  [split-layers] teardown in {nn - nnn:.2f}s")
 
     return written

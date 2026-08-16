@@ -4,24 +4,22 @@ parallel.py
 Subprocess fan-out helper used by the "all" modes of the pipeline scripts.
 
 Each work item is processed in its own child process (so each one gets its
-own fresh ``bpy`` state). Child stdout/stderr is streamed back line by line
-with a ``[label] `` prefix so interleaved output from concurrent workers
-stays readable.
+own fresh ``bpy`` state). Child stdout/stderr is streamed back line by line,
+prefixed with ``[label] ``, into the caller's ``ScriptTUI`` so interleaved
+output from concurrent workers lands in the same scrolling log the rest of
+the script uses.
 """
 
 from __future__ import annotations
 
 import re
 import subprocess
-import sys
 import threading
 import time
 from typing import Callable, List, Sequence
 
 from utils.config import REPO_ROOT
-
-
-_PRINT_LOCK = threading.Lock()
+from utils.tui import ScriptTUI
 
 
 # Match any absolute path that starts with REPO_ROOT (both "\" and "/"
@@ -51,8 +49,8 @@ def _make_path_shortener() -> Callable[[str], str]:
 _shorten_paths = _make_path_shortener()
 
 
-def _pump(label: str, proc: subprocess.Popen) -> None:
-    """Forward a child's stdout to our stdout, prefixed with ``[label] ``.
+def _pump(label: str, proc: subprocess.Popen, tui: ScriptTUI) -> None:
+    """Forward a child's stdout into the TUI's log, prefixed ``[label] ``.
 
     Repo-root absolute paths in the line are rewritten to repo-relative
     POSIX paths so Blender's native log output doesn't dump 100+ char
@@ -60,23 +58,23 @@ def _pump(label: str, proc: subprocess.Popen) -> None:
     """
     assert proc.stdout is not None
     for line in proc.stdout:
-        with _PRINT_LOCK:
-            sys.stdout.write(f"[{label}] {_shorten_paths(line)}")
-            sys.stdout.flush()
+        tui.log(f"[{label}] {_shorten_paths(line).rstrip()}")
 
 
 def run_parallel_subprocesses(
     items: Sequence[str],
     build_cmd: Callable[[str], List[str]],
     workers: int,
+    tui: ScriptTUI,
     label_fn: Callable[[str], str] = lambda x: x,
 ) -> List[str]:
     """
     Run one subprocess per item with at most ``workers`` running at once.
 
-    Each output line is prefixed with "[i/N name] " where ``name`` is
-    ``label_fn(item)`` right-padded to the longest label so concurrent
-    workers line up in the terminal.
+    Each forwarded output line is prefixed with "[i/N name] " where
+    ``name`` is ``label_fn(item)`` right-padded to the longest label so
+    concurrent workers line up in the log. ``tui`` advances by one for
+    every *completed* (not launched) child.
 
     Returns the list of items whose subprocess exited with a non-zero code.
     """
@@ -104,8 +102,7 @@ def run_parallel_subprocesses(
     def _launch(item: str) -> None:
         label = _prefix(item)
         cmd = build_cmd(item)
-        with _PRINT_LOCK:
-            print(f"[{label}] launching", flush=True)
+        tui.log(f"[{label}] launching")
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -114,7 +111,7 @@ def run_parallel_subprocesses(
             bufsize=1,
         )
         thread = threading.Thread(
-            target=_pump, args=(label, proc), daemon=True,
+            target=_pump, args=(label, proc, tui), daemon=True,
         )
         thread.start()
         active[proc] = (item, thread, label)
@@ -128,9 +125,9 @@ def run_parallel_subprocesses(
             item, thread, label = active.pop(proc)
             thread.join(timeout=5)
             rc = proc.returncode
-            with _PRINT_LOCK:
-                status = "OK" if rc == 0 else f"FAILED (rc={rc})"
-                print(f"[{label}] done: {status}", flush=True)
+            status = "OK" if rc == 0 else f"FAILED (rc={rc})"
+            tui.log(f"[{label}] done: {status}")
+            tui.advance()
             if rc != 0:
                 failed.append(item)
             if pending:

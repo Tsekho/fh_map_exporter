@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 from utils.config import CENTRES_FILE, JSON_DIR, MASK_FILE, TILE_SIZE
+from utils.tui import ScriptTUI
 
 
 # Trim amount (per side, in pixels) applied after optional downscale.
@@ -203,21 +204,23 @@ def main() -> int:
 
     total = len(centres)
     size_label = "1024x888" if one_k else "2048x1776"
-    print(
-        f"\n=== breaking {src_path.name} ({src.shape[1]}x{src.shape[0]}) "
-        f"into {total} regions @ {size_label} ==="
+    title = (
+        f"breaking {src_path.name} ({src.shape[1]}x{src.shape[0]}) "
+        f"into {total} regions @ {size_label}"
     )
-    print(f"    output: {out_dir}")
 
-    for i, (name, (cx, cy)) in enumerate(centres.items(), 1):
-        tile = _extract_tile(src, cx, cy)
-        tile = _apply_mask(tile, mask)
-        tile = _finalize(tile, one_k)
-        out_path = out_dir / f"{name}.png"
-        cv2.imwrite(str(out_path), tile)
-        print(f"  [{i:>{len(str(total))}}/{total}] {out_path.name}")
+    with ScriptTUI(title=title, total=total) as tui:
+        tui.log(f"output: {out_dir}")
+        for name, (cx, cy) in centres.items():
+            tile = _extract_tile(src, cx, cy)
+            tile = _apply_mask(tile, mask)
+            tile = _finalize(tile, one_k)
+            out_path = out_dir / f"{name}.png"
+            cv2.imwrite(str(out_path), tile)
+            tui.step(f"  {out_path.name}")
 
-    print("\n=== SUCCESS ===")
+        tui.log("=== SUCCESS ===")
+
     return 0
 
 

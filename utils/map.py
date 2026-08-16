@@ -19,6 +19,7 @@ from utils.blender import (
 )
 from utils.psk import clear_caches, get_mesh, mesh_cache
 from utils.config import short_path
+from utils.tui import log
 
 
 class Map:
@@ -52,7 +53,7 @@ class Map:
                    if len(self.include) > 8 else (self.include or "none"))
             exc = (f"{len(self.exclude)} pattern(s)"
                    if len(self.exclude) > 8 else (self.exclude or "none"))
-            print(f"  Filters - include: {inc}, exclude: {exc}")
+            log(f"  Filters - include: {inc}, exclude: {exc}")
 
         raw_symbols: Dict[str, list] = data.get("symbols", {})
         raw_groups: Dict[str, list] = data.get("groups", {})
@@ -117,7 +118,7 @@ class Map:
                         mesh.materials.append(mat)
                     colored += 1
                     break
-        print(f"  Palette applied: {colored} mesh(es) colored")
+        log(f"  Palette applied: {colored} mesh(es) colored")
 
     def _flatten(self) -> Dict[str, List[list]]:
         """Merge symbols + groups + blueprint meshes into {mesh: [transforms]}."""
@@ -148,7 +149,7 @@ class Map:
         flat = self._flatten()
         if announce:
             inst_count = sum(len(v) for v in flat.values())
-            print(f"[meshes] {len(flat):,} unique meshes, "
+            log(f"[meshes] {len(flat):,} unique meshes, "
                   f"{inst_count:,} instances ...")
 
         total = 0
@@ -192,7 +193,7 @@ class Map:
         if announce:
             total_inst = sum(len(v) for k, v in flat.items() if k in mesh_to_category)
             placed_meshes = sum(1 for k in flat if k in mesh_to_category)
-            print(f"[meshes] {placed_meshes:,} unique meshes, "
+            log(f"[meshes] {placed_meshes:,} unique meshes, "
                   f"{total_inst:,} instances ...")
 
         cat_roots: Dict[str, bpy.types.Collection] = {}
@@ -244,7 +245,7 @@ class Map:
         if self.symbols:
             if announce:
                 s_inst = sum(len(v) for v in self.symbols.values())
-                print(f"[symbols] {len(self.symbols):,} unique meshes, "
+                log(f"[symbols] {len(self.symbols):,} unique meshes, "
                       f"{s_inst:,} instances ...")
             s_root = bpy.data.collections.new("Symbols")
             root.children.link(s_root)
@@ -262,7 +263,7 @@ class Map:
         if self.groups:
             if announce:
                 g_inst = sum(len(v) for v in self.groups.values())
-                print(f"[groups]  {len(self.groups):,} unique meshes, "
+                log(f"[groups]  {len(self.groups):,} unique meshes, "
                       f"{g_inst:,} instances ...")
             g_root = bpy.data.collections.new("Groups")
             root.children.link(g_root)
@@ -280,7 +281,7 @@ class Map:
         if self.splines:
             if announce:
                 sp_inst = sum(len(v) for v in self.splines.values())
-                print(f"[splines] {len(self.splines):,} unique meshes, "
+                log(f"[splines] {len(self.splines):,} unique meshes, "
                       f"{sp_inst:,} instances ...")
             sp_root = bpy.data.collections.new("Splines")
             root.children.link(sp_root)
@@ -304,7 +305,7 @@ class Map:
                     for lst in self.blueprints.values()
                     for inst in lst
                 )
-                print(f"[blueprints] {len(self.blueprints):,} classes, "
+                log(f"[blueprints] {len(self.blueprints):,} classes, "
                       f"{bp_inst:,} mesh instances ...")
             b_root = bpy.data.collections.new("Blueprints")
             root.children.link(b_root)
@@ -348,12 +349,12 @@ class Map:
 
         if terrain:
             if os.path.exists(self.heightmap_path):
-                print("[terrain] Building terrain ...")
+                log("[terrain] Building terrain ...")
                 t_coll = bpy.data.collections.new("Terrain")
                 root.children.link(t_coll)
                 create_terrain(self.heightmap_path, t_coll)
             else:
-                print(f"[terrain] Heightmap not found, skipping: "
+                log(f"[terrain] Heightmap not found, skipping: "
                       f"{short_path(self.heightmap_path)}")
 
         total += self._populate(root, coll_cache)
@@ -361,7 +362,7 @@ class Map:
 
         loaded_ok = sum(1 for v in mesh_cache.values() if v is not None)
         loaded_err = sum(1 for v in mesh_cache.values() if v is None)
-        print(
+        log(
             f"\n  Objects placed : {total:,}\n"
             f"  Unique meshes  : {loaded_ok} loaded, "
             f"{loaded_err} missing/errored"
@@ -370,6 +371,6 @@ class Map:
         os.makedirs(os.path.dirname(self.blend_path), exist_ok=True)
         if os.path.exists(self.blend_path):
             os.remove(self.blend_path)
-        print(f"\nSaving -> {short_path(self.blend_path)} ...")
+        log(f"\nSaving -> {short_path(self.blend_path)} ...")
         bpy.ops.wm.save_as_mainfile(filepath=self.blend_path, compress=True)
-        print("Done.\n")
+        log("Done.\n")
