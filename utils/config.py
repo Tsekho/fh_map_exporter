@@ -98,6 +98,12 @@ TUI_BAR_WIDTH = 30
 # no log/advance calls in between).
 TUI_TICK_INTERVAL_S = 1.0
 
+# Exponential-moving-average weight given to each newly-completed item's
+# duration when estimating ETA (0..1). Higher = ETA reacts faster to
+# recent items but is noisier; lower = smoother but slower to adapt when
+# per-item cost changes (e.g. a much bigger region partway through a run).
+TUI_ETA_SMOOTHING = 0.3
+
 
 # ------------------------------------------------------------------------------
 #  Shared prompt menus (utils/prompt.py)

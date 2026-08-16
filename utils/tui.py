@@ -43,7 +43,7 @@ import time
 from types import FrameType, TracebackType
 from typing import Optional, TextIO, Tuple, Type
 
-from utils.config import TUI_BAR_WIDTH, TUI_TICK_INTERVAL_S
+from utils.config import TUI_BAR_WIDTH, TUI_ETA_SMOOTHING, TUI_TICK_INTERVAL_S
 
 _CSI = "\x1b["
 _HIDE_CURSOR = f"{_CSI}?25l"
@@ -186,6 +186,8 @@ class ScriptTUI:
         self._stream = stream
         self._lock = threading.Lock()
         self._start = 0.0
+        self._last_advance_time = 0.0
+        self._ema_item_seconds: Optional[float] = None
         self._interactive = False
         self._unicode_bar = False
         self._suspended = False
@@ -201,6 +203,7 @@ class ScriptTUI:
         self._interactive = self._stream.isatty() and _enable_windows_vt(self._stream)
         self._unicode_bar = self._interactive and _supports_unicode_bar(self._stream)
         self._start = time.monotonic()
+        self._last_advance_time = self._start
         self._prior_active = _ACTIVE
         _ACTIVE = self
         atexit.register(self._restore)
@@ -300,20 +303,38 @@ class ScriptTUI:
         rest = _BLOCK_EMPTY * empty
         return f"{_GREEN}{done}{_RESET}{_DIM}{rest}{_RESET}"
 
+    def _eta_seconds(self) -> Optional[float]:
+        """Smoothed ETA: exponential-moving-average per-item duration
+        (see TUI_ETA_SMOOTHING) times items remaining. None until at
+        least one item has completed -- there's no rate to extrapolate
+        from yet. Smoothing rides out per-item cost variance (e.g. one
+        much bigger region) far better than a plain elapsed/completed
+        average would."""
+        if self._total <= 0 or self._ema_item_seconds is None:
+            return None
+        if self._completed >= self._total:
+            return 0.0
+        return self._ema_item_seconds * (self._total - self._completed)
+
     def _bar_text(self) -> str:
         total = max(self._total, 1)
         frac = min(self._completed / total, 1.0)
         percent = int(round(frac * 100))
         elapsed = _format_elapsed(time.monotonic() - self._start)
+        eta_s = self._eta_seconds()
+        eta = _format_elapsed(eta_s) if eta_s is not None else "--:--"
 
-        # This suffix (percent, x/y count, elapsed time) must always be
-        # fully visible -- the bar graphic shrinks first, then the
+        # This suffix (percent, x/y count, elapsed/eta time) must always
+        # be fully visible -- the bar graphic shrinks first, then the
         # description, to make room for it on narrow terminals.
-        suffix_plain = f"{percent:3d}%  {self._completed}/{self._total}  elapsed {elapsed}"
+        suffix_plain = (
+            f"{percent:3d}%  {self._completed}/{self._total}  "
+            f"elapsed {elapsed}  eta {eta}"
+        )
         suffix = (
             f"{_BOLD}{percent:3d}%{_RESET}  "
             f"{_CYAN}{self._completed}/{self._total}{_RESET}  "
-            f"{_DIM}elapsed {elapsed}{_RESET}"
+            f"{_DIM}elapsed {elapsed}  eta {eta}{_RESET}"
         )
 
         columns = shutil.get_terminal_size(fallback=(100, 24)).columns
@@ -372,6 +393,15 @@ class ScriptTUI:
     def advance(self, n: int = 1) -> None:
         with self._lock:
             self._completed += n
+            now = time.monotonic()
+            if n > 0:
+                item_seconds = (now - self._last_advance_time) / n
+                self._ema_item_seconds = (
+                    item_seconds if self._ema_item_seconds is None
+                    else TUI_ETA_SMOOTHING * item_seconds
+                    + (1 - TUI_ETA_SMOOTHING) * self._ema_item_seconds
+                )
+            self._last_advance_time = now
             if not self._interactive:
                 print(f"[{self._completed}/{self._total}] {self._description}",
                       file=self._stream)
