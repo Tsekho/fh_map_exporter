@@ -73,23 +73,31 @@ _LEVEL_COLORS = {
 _LEVEL_TAG_WIDTH = max(len(tag) for tag in _LEVEL_TAGS.values())
 
 
-def _tag_prefix(level: str, *, colored: bool) -> str:
+def _tag_prefix(level: str, *, colored: bool, context: Optional[str] = None) -> str:
     """Left-aligned, fixed-width level tag with one space of padding on
     each side, e.g. " INFO  " / " WARN  " / " ERROR ". Colored with a
     background block when the stream supports ANSI, else a plain
-    bracketed fallback of the same tag width."""
+    bracketed fallback of the same tag width. When ``context`` is given
+    (e.g. the item a parallel worker is processing), it's appended as a
+    second, cyan "(name)" tag -- unlike the level tag it isn't padded to
+    a fixed width, since context values vary a lot in length."""
     tag = _LEVEL_TAGS.get(level, _LEVEL_TAGS["info"]).ljust(_LEVEL_TAG_WIDTH)
     if not colored:
-        return f"[{tag}] "
+        prefix = f"[{tag}] "
+        return f"{prefix}({context}) " if context else prefix
     bg, fg = _LEVEL_COLORS.get(level, _LEVEL_COLORS["info"])
-    return f"{bg}{fg}{_BOLD} {tag} {_RESET} "
+    prefix = f"{bg}{fg}{_BOLD} {tag} {_RESET} "
+    return f"{prefix}{_CYAN}({context}){_RESET} " if context else prefix
 
 
-def _tag_lines(message: str, level: str, *, colored: bool) -> str:
-    """Prefix every non-blank line of ``message`` with a level tag; blank
-    lines (e.g. the leading "\\n" in banner-style messages) are left
-    untouched rather than getting a tagged empty row."""
-    prefix = _tag_prefix(level, colored=colored)
+def _tag_lines(
+    message: str, level: str, *, colored: bool, context: Optional[str] = None,
+) -> str:
+    """Prefix every non-blank line of ``message`` with a level tag (and
+    optional context tag); blank lines (e.g. the leading "\\n" in
+    banner-style messages) are left untouched rather than getting a
+    tagged empty row."""
+    prefix = _tag_prefix(level, colored=colored, context=context)
     return "\n".join(
         prefix + line if line else line for line in message.split("\n")
     )
@@ -369,12 +377,15 @@ class ScriptTUI:
 
     # -- public API ----------------------------------------------------------
 
-    def log(self, message: str = "", *, level: str = "info") -> None:
+    def log(
+        self, message: str = "", *, level: str = "info", context: Optional[str] = None,
+    ) -> None:
         with self._lock:
             if not self._interactive:
-                print(_tag_lines(message, level, colored=False), file=self._stream)
+                print(_tag_lines(message, level, colored=False, context=context),
+                      file=self._stream)
                 return
-            tagged = _tag_lines(message, level, colored=True)
+            tagged = _tag_lines(message, level, colored=True, context=context)
             if self._suspended:
                 self._stream.write(tagged + "\n")
                 self._stream.flush()
@@ -395,11 +406,11 @@ class ScriptTUI:
                 self._stream.write(line + "\n")
             self._redraw_locked()
 
-    def warn(self, message: str) -> None:
-        self.log(message, level="warn")
+    def warn(self, message: str, *, context: Optional[str] = None) -> None:
+        self.log(message, level="warn", context=context)
 
-    def error(self, message: str) -> None:
-        self.log(message, level="error")
+    def error(self, message: str, *, context: Optional[str] = None) -> None:
+        self.log(message, level="error", context=context)
 
     def advance(self, n: int = 1) -> None:
         with self._lock:
@@ -429,9 +440,11 @@ class ScriptTUI:
             self._description = text
             self._redraw_locked()
 
-    def step(self, message: str, *, level: str = "info") -> None:
+    def step(
+        self, message: str, *, level: str = "info", context: Optional[str] = None,
+    ) -> None:
         """Log a line and advance the counter by one, in that order."""
-        self.log(message, level=level)
+        self.log(message, level=level, context=context)
         self.advance(1)
 
     def suspend(self) -> "_Suspend":
@@ -466,19 +479,19 @@ class _Suspend:
 # is currently active without threading a `tui` object through every
 # function signature. Falls back to plain print() when no TUI is active.
 
-def log(message: str = "", *, level: str = "info") -> None:
+def log(message: str = "", *, level: str = "info", context: Optional[str] = None) -> None:
     if _ACTIVE is not None:
-        _ACTIVE.log(message, level=level)
+        _ACTIVE.log(message, level=level, context=context)
     else:
-        print(_tag_lines(message, level, colored=False))
+        print(_tag_lines(message, level, colored=False, context=context))
 
 
-def warn(message: str) -> None:
-    log(message, level="warn")
+def warn(message: str, *, context: Optional[str] = None) -> None:
+    log(message, level="warn", context=context)
 
 
-def error(message: str) -> None:
-    log(message, level="error")
+def error(message: str, *, context: Optional[str] = None) -> None:
+    log(message, level="error", context=context)
 
 
 def advance(n: int = 1) -> None:
@@ -496,6 +509,6 @@ def set_description(text: str) -> None:
         _ACTIVE.set_description(text)
 
 
-def step(message: str, *, level: str = "info") -> None:
-    log(message, level=level)
+def step(message: str, *, level: str = "info", context: Optional[str] = None) -> None:
+    log(message, level=level, context=context)
     advance(1)
