@@ -7,6 +7,8 @@ from typing import Dict, List, Optional, Tuple
 import bpy
 import numpy as np
 
+from utils.tui import warn
+
 
 class _Section(ctypes.Structure):
     _fields_ = [
@@ -147,9 +149,9 @@ def get_mesh(mesh_name: str, meshes_dir: str) -> Optional[bpy.types.Mesh]:
                     mesh = psk_to_blender_mesh(pts, wdgs, fcs, mesh_name)
                     mesh_cache[mesh_name] = mesh
                     return mesh
-                print(f"  [WARN] Empty PSK: {path}")
+                warn(f"  Empty PSK: {path}")
             except Exception as exc:
-                print(f"  [WARN] PSK read error ({mesh_name}): {exc}")
+                warn(f"  PSK read error ({mesh_name}): {exc}")
             break
 
     mesh_cache[mesh_name] = None
@@ -181,7 +183,7 @@ def get_raw_psk(mesh_name: str, meshes_dir: str):
             _psk_raw_cache[mesh_name] = (verts, tris)
             return _psk_raw_cache[mesh_name]
         except Exception as exc:
-            print(f"  [WARN] PSK raw read error ({mesh_name}): {exc}")
+            warn(f"  PSK raw read error ({mesh_name}): {exc}")
         break
 
     _psk_raw_cache[mesh_name] = None

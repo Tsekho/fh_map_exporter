@@ -50,6 +50,7 @@ from utils.config import (
     SVG_LAYERS_DIR,
     TILE_SIZE,
 )
+from utils.tui import log, warn
 
 # The "bridges_aim" layer is rendered procedurally (see
 # render_bridges_aim_layer) into its own BRIDGES_AIM_DIR rather than by
@@ -190,7 +191,7 @@ def render_svg_layers(region_name: str) -> bool:
 
     json_path = JSON_DIR / f"{region_name}.json"
     if not json_path.is_file():
-        print(f"  [WARN] SVG layers: no JSON at {json_path}; skipped")
+        warn(f"  SVG layers: no JSON at {json_path}; skipped")
         return False
 
     with json_path.open("r", encoding="utf-8") as f:
@@ -215,9 +216,9 @@ def render_svg_layers(region_name: str) -> bool:
                 output_height=TILE_SIZE,
             )
         except Exception as exc:
-            print(f"  [WARN] svg layer '{layer}' rasterize failed: {exc}")
+            warn(f"  svg layer '{layer}' rasterize failed: {exc}")
             continue
-        print(f"    [{i:>{w}}/{total_layers}] {layer}: "
+        log(f"    [{i:>{w}}/{total_layers}] {layer}: "
               f"{n} placement(s) -> {out_path.name}")
     return True
 
@@ -935,7 +936,7 @@ def render_bridges_aim_layer(
 
     json_path = JSON_DIR / f"{region_name}.json"
     if not json_path.is_file():
-        print(f"  [WARN] bridges_aim: no JSON at {json_path}; skipped")
+        warn(f"  bridges_aim: no JSON at {json_path}; skipped")
         return False
     with json_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -964,10 +965,10 @@ def render_bridges_aim_layer(
             output_height=TILE_SIZE,
         )
     except Exception as exc:
-        print(f"  [WARN] bridges_aim rasterize failed: {exc}")
+        warn(f"  bridges_aim rasterize failed: {exc}")
         return False
 
     n_pairs = len(pairs) if sockets else 0
-    print(f"  [bridges_aim] {len(sockets)} socket(s), {n_pairs} snapped "
+    log(f"  [bridges_aim] {len(sockets)} socket(s), {n_pairs} snapped "
           f"pair(s) -> {out_path.name}")
     return True

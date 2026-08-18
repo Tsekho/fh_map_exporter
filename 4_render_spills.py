@@ -64,7 +64,11 @@ from utils.bake import (
     render_split_layers_ao,
 )
 from utils.parallel import run_parallel_subprocesses
+from utils.prompt import is_interactive, multiselect, select
 from utils.svg_render import render_bridges_aim_layer, render_svg_layers
+from utils.tui import ScriptTUI
+from utils.tui import log as tui_log
+from utils.tui import warn as tui_warn
 
 
 def _load_region_water_dist(region_name: str) -> Optional[np.ndarray]:
@@ -92,8 +96,8 @@ def _load_region_water_dist(region_name: str) -> Optional[np.ndarray]:
         hw = cv2.imread(
             str(HM_WATER_DIR / f"{region_name}.png"), cv2.IMREAD_UNCHANGED)
         if hl is None or hw is None:
-            print("  [WARN] bridges_aim: heightmap bake(s) missing; "
-                  "navigability depth gate skipped")
+            tui_warn("  bridges_aim: heightmap bake(s) missing; "
+                     "navigability depth gate skipped")
         else:
             depth_cm = hw.astype(np.int32) - hl.astype(np.int32)
             deep = depth_cm >= int(round(BRIDGES_AIM_MIN_DEPTH_M * 100))
@@ -204,7 +208,7 @@ def _collect_focus_objects(
         summary = ", ".join(
             f"{c}+{n}" for c, n in spill_added.items() if n
         )
-        print(f"  Neighbor spill folded in: {summary}")
+        tui_log(f"  Neighbor spill folded in: {summary}")
 
     for r in RESERVED_CATS:
         buckets.setdefault(r, [])
@@ -248,18 +252,18 @@ def render_one(
 ) -> bool:
     region_name = blend_path.stem
     w = len(str(region_total))
-    print(f"\n=== [{region_idx:>{w}}/{region_total}] {region_name} ===")
+    tui_log(f"\n=== [{region_idx:>{w}}/{region_total}] {region_name} ===")
 
     # SVG layers are driven purely by the region JSON, so render them
     # before opening the .blend (cheap, no Blender state required).
     ok = True
     if do_svg:
-        print(f"  [svg] rasterizing {region_name} svg layers")
+        tui_log(f"  [svg] rasterizing {region_name} svg layers")
         try:
             if not render_svg_layers(region_name):
                 ok = False
         except Exception as exc:
-            print(f"  [WARN] SVG layer render failed: {exc}")
+            tui_warn(f"  SVG layer render failed: {exc}")
             ok = False
 
     bpy.ops.wm.open_mainfile(filepath=str(blend_path))
@@ -281,7 +285,7 @@ def render_one(
 
     objs = _collect_focus_objects(region_name)
     if objs is None:
-        print(f"  [WARN] root collection '{region_name}' not found; skipped")
+        tui_warn(f"  root collection '{region_name}' not found; skipped")
         return False
 
     spill_cats = _spill_categories(objs)
@@ -292,8 +296,8 @@ def render_one(
         if lst and c not in RESERVED_CATS and c not in set(TERRAIN_WHITELIST)
     )
     if excluded:
-        print(f"  Excluded from ao/hm/id (not in TERRAIN_WHITELIST): "
-              f"{', '.join(excluded)}")
+        tui_log(f"  Excluded from ao/hm/id (not in TERRAIN_WHITELIST): "
+                f"{', '.join(excluded)}")
 
     if split_objs:
         present = []
@@ -302,7 +306,7 @@ def render_one(
             if cats_with_objs:
                 present.append(f"{layer}({'+'.join(cats_with_objs)})")
         if present:
-            print(f"  Split layers: {', '.join(present)}")
+            tui_log(f"  Split layers: {', '.join(present)}")
 
     splines = _collect_splines(region_name)
     terrain_spline_objs: List[bpy.types.Object] = []
@@ -317,14 +321,14 @@ def render_one(
     if splines:
         summary = ", ".join(f"{k}:{len(v)}" for k, v in splines.items() if v)
         if summary:
-            print(f"  Splines: {summary}")
+            tui_log(f"  Splines: {summary}")
 
     if region_name in Z_FIX_REGIONS:
         focus_terrain = _collect_focus_terrain_objects(region_name)
         if focus_terrain:
             n_culled = _cull_terrain_below(focus_terrain, TERRAIN_CULL_MIN_Z)
-            print(f"  [terrain-cull] {region_name}: deleted {n_culled} "
-                  f"vertex(es) with z < {TERRAIN_CULL_MIN_Z} m")
+            tui_log(f"  [terrain-cull] {region_name}: deleted {n_culled} "
+                    f"vertex(es) with z < {TERRAIN_CULL_MIN_Z} m")
 
     def _out(sub: Path) -> str:
         return str((sub / f"{region_name}.png").resolve())
@@ -337,7 +341,7 @@ def render_one(
 
     if do_hm:
         try:
-            print(_tag("heightmap (landscape)"))
+            tui_log(_tag("heightmap (landscape)"))
             hm_objs = objs["terrain"] + _spill_objs() + terrain_spline_objs
             raycast_heightmap(
                 _out(HM_LANDSCAPE_DIR),
@@ -345,11 +349,11 @@ def render_one(
                 occluders=objs["deep_water"],
             )
         except Exception as exc:
-            print(f"  [WARN] heightmap bake failed: {exc}")
+            tui_warn(f"  heightmap bake failed: {exc}")
             ok = False
 
         try:
-            print(_tag("heightmap (water surface)"))
+            tui_log(_tag("heightmap (water surface)"))
             hm_water_objs = (
                 objs["terrain"] + _spill_objs()
                 + terrain_spline_objs + objs["water"]
@@ -360,12 +364,12 @@ def render_one(
                 occluders=objs["deep_water"],
             )
         except Exception as exc:
-            print(f"  [WARN] heightmap_water bake failed: {exc}")
+            tui_warn(f"  heightmap_water bake failed: {exc}")
             ok = False
 
     if do_id:
         try:
-            print(_tag(
+            tui_log(_tag(
                 f"ID per-category coverage (SSAA {ID_SSAA}x{ID_SSAA})"
             ))
             id_cats: Dict[str, List[bpy.types.Object]] = {
@@ -386,7 +390,7 @@ def render_one(
                 occluders=None,
                 samples_per_side=ID_SSAA,
             )
-            print(_tag(f"water coverage (SSAA {ID_SSAA}x{ID_SSAA})"))
+            tui_log(_tag(f"water coverage (SSAA {ID_SSAA}x{ID_SSAA})"))
             water_occluders = (
                 objs["terrain"] + _spill_objs() + terrain_spline_objs
                 + objs["deep_water"]
@@ -401,12 +405,12 @@ def render_one(
                 samples_per_side=ID_SSAA,
             )
         except Exception as exc:
-            print(f"  [WARN] ID coverage bake failed: {exc}")
+            tui_warn(f"  ID coverage bake failed: {exc}")
             ok = False
 
     if do_ao:
         try:
-            print(_tag("AO"))
+            tui_log(_tag("AO"))
             _ray_keys = (
                 "diffuse", "glossy", "transmission",
                 "volume_scatter", "shadow",
@@ -440,7 +444,7 @@ def render_one(
                         if hasattr(o, f"visible_{k}"):
                             setattr(o, f"visible_{k}", v)
         except Exception as exc:
-            print(f"  [WARN] AO bake failed: {exc}")
+            tui_warn(f"  AO bake failed: {exc}")
             ok = False
 
     def _run_spline_layer(out_dir: Path, target_cats: tuple, label: str,
@@ -470,7 +474,7 @@ def render_one(
                    for c in target_cats}
 
         if include_terrain:
-            print(_tag(
+            tui_log(_tag(
                 f"{label} (terrain dropped "
                 f"{SPLINE_LAYER_TERRAIN_DROP:.2f} m)"
             ))
@@ -479,7 +483,7 @@ def render_one(
             )
             terrain_drop = SPLINE_LAYER_TERRAIN_DROP
         else:
-            print(_tag(f"{label} (terrain excluded)"))
+            tui_log(_tag(f"{label} (terrain excluded)"))
             terrain_occluders = None
             terrain_drop = 0.0
 
@@ -508,8 +512,8 @@ def render_one(
             roads_img = cv2.imread(str(roads_path), cv2.IMREAD_UNCHANGED)
             if (roads_img is None or roads_img.ndim != 3
                     or roads_img.shape[2] != 4):
-                print("  [WARN] roads blur skipped "
-                      "(unreadable or non-RGBA output)")
+                tui_warn("  roads blur skipped "
+                         "(unreadable or non-RGBA output)")
             else:
                 bgr = roads_img[..., :3].astype(np.float32)
                 a = roads_img[..., 3].astype(np.float32) / 255.0
@@ -522,8 +526,8 @@ def render_one(
                 visible = roads_img[..., 3] > 0
                 roads_img[..., :3][visible] = new_bgr[visible]
                 cv2.imwrite(str(roads_path), roads_img)
-                print("  [roads] 3x3 alpha-weighted RGB blur applied "
-                      "(alpha preserved)")
+                tui_log("  [roads] 3x3 alpha-weighted RGB blur applied "
+                        "(alpha preserved)")
 
     if do_beaches:
         if not _run_spline_layer(BEACHES_DIR, BEACHES_CATS, "beaches",
@@ -534,8 +538,8 @@ def render_one(
             terrain_path = ID_DIR / "terrain" / f"{region_name}.png"
             water_path = ID_DIR / "water" / f"{region_name}.png"
             if not (terrain_path.is_file() and water_path.is_file()):
-                print("  [WARN] beaches land-mask skipped "
-                      "(missing per-region terrain/water ID PNG)")
+                tui_warn("  beaches land-mask skipped "
+                         "(missing per-region terrain/water ID PNG)")
             else:
                 beach_img = cv2.imread(str(beach_path), cv2.IMREAD_UNCHANGED)
                 terrain_cov = cv2.imread(str(terrain_path),
@@ -545,8 +549,8 @@ def render_one(
                 if (beach_img is None or terrain_cov is None
                         or water_cov is None or beach_img.ndim != 3
                         or beach_img.shape[2] != 4):
-                    print("  [WARN] beaches land-mask skipped "
-                          "(unreadable or non-RGBA inputs)")
+                    tui_warn("  beaches land-mask skipped "
+                             "(unreadable or non-RGBA inputs)")
                 else:
                     non_water = (255 - water_cov).astype(np.uint16)
                     land = (
@@ -559,8 +563,8 @@ def render_one(
                     ).astype(np.uint8)
                     beach_img[..., 3] = new_alpha
                     cv2.imwrite(str(beach_path), beach_img)
-                    print("  [beaches] alpha masked to land "
-                          "(terrain * non-water)")
+                    tui_log("  [beaches] alpha masked to land "
+                            "(terrain * non-water)")
 
     if do_split_layers:
         batch: List[Tuple[str, List[Tuple[List[bpy.types.Object], str]], str]] = []
@@ -581,7 +585,7 @@ def render_one(
                 group_cats.append(cat)
 
             if not groups:
-                print(_tag(
+                tui_log(_tag(
                     f"split layer '{layer}': no meshes; writing empty image"
                 ))
                 blank = np.zeros(
@@ -603,11 +607,11 @@ def render_one(
             try:
                 render_split_layers_ao(
                     batch, mask,
-                    announce=lambda lbl: print(_tag(lbl)),
+                    announce=lambda lbl: tui_log(_tag(lbl)),
                     skip_teardown=True,
                 )
             except Exception as exc:
-                print(f"  [WARN] split layers bake failed: {exc}")
+                tui_warn(f"  split layers bake failed: {exc}")
                 ok = False
 
     if do_svg:
@@ -616,13 +620,13 @@ def render_one(
         # aim lines at the shoreline using this region's land mask.
         water_dist = _load_region_water_dist(region_name)
         if water_dist is None:
-            print("  [bridges_aim] no water ID PNG; "
-                  "aim lines drawn at full length (no steering/cut)")
+            tui_log("  [bridges_aim] no water ID PNG; "
+                    "aim lines drawn at full length (no steering/cut)")
         try:
             if not render_bridges_aim_layer(region_name, water_dist):
                 ok = False
         except Exception as exc:
-            print(f"  [WARN] bridges_aim render failed: {exc}")
+            tui_warn(f"  bridges_aim render failed: {exc}")
             ok = False
 
     return ok
@@ -634,8 +638,7 @@ def _list_blends() -> List[Path]:
     return sorted(SPILL_DIR.glob("*.blend"))
 
 
-def pick_region_interactive(blends: List[Path]) -> Optional[List[Path]]:
-    names = [p.stem for p in blends]
+def _pick_region_fallback(blends: List[Path], names: List[str]) -> Optional[List[Path]]:
     print("Available .blend spills:")
     print("    0. All regions")
     for i, name in enumerate(names, 1):
@@ -653,17 +656,32 @@ def pick_region_interactive(blends: List[Path]) -> Optional[List[Path]]:
         print("  Invalid selection, try again.")
 
 
-def ask_bakes() -> Tuple[bool, bool, bool, bool, bool, bool, bool]:
-    print(
-        "Bakes:\n"
-        "  svg -> svg_layers/<layer> + bridges_aim\n"
-        "  ao  -> ao\n"
-        "  hm  -> heightmap_landscape + heightmap_water\n"
-        "  id  -> id/<category> (incl. id/water)\n"
-        "  r   -> roads\n"
-        "  b   -> beaches\n"
-        "  sl  -> split_layers/<layer>"
-    )
+def pick_region_interactive(blends: List[Path]) -> Optional[List[Path]]:
+    names = [p.stem for p in blends]
+
+    if not is_interactive():
+        return _pick_region_fallback(blends, names)
+
+    idx = select("Select region", ["All regions"] + names)
+    if idx is None:
+        return None
+    return blends if idx == 0 else [blends[idx - 1]]
+
+
+_BAKE_TOKENS = ("svg", "ao", "hm", "id", "r", "b", "sl")
+_BAKE_LABELS = (
+    "svg  -> svg_layers/<layer> + bridges_aim",
+    "ao   -> ao",
+    "hm   -> heightmap_landscape + heightmap_water",
+    "id   -> id/<category> (incl. id/water)",
+    "r    -> roads",
+    "b    -> beaches",
+    "sl   -> split_layers/<layer>",
+)
+
+
+def _ask_bakes_fallback() -> Tuple[bool, bool, bool, bool, bool, bool, bool]:
+    print("Bakes:\n  " + "\n  ".join(_BAKE_LABELS))
     while True:
         raw = input(
             "Select bakes (space-separated from: svg ao hm id r b sl; "
@@ -672,15 +690,23 @@ def ask_bakes() -> Tuple[bool, bool, bool, bool, bool, bool, bool]:
         if raw == "":
             return True, True, True, True, True, True, True
         tokens = raw.replace(",", " ").split()
-        valid = {"svg", "ao", "hm", "id", "r", "b", "sl"}
+        valid = set(_BAKE_TOKENS)
         if any(t not in valid for t in tokens):
             print("  Invalid token, try again.")
             continue
-        return (
-            "svg" in tokens,
-            "ao" in tokens, "hm" in tokens, "id" in tokens,
-            "r" in tokens, "b" in tokens, "sl" in tokens,
-        )
+        return tuple(t in tokens for t in _BAKE_TOKENS)
+
+
+def ask_bakes() -> Tuple[bool, bool, bool, bool, bool, bool, bool]:
+    if not is_interactive():
+        return _ask_bakes_fallback()
+
+    checked = multiselect(
+        "Select bakes", list(_BAKE_LABELS), checked=set(range(len(_BAKE_TOKENS))),
+    )
+    if checked is None:
+        raise KeyboardInterrupt
+    return tuple(i in checked for i in range(len(_BAKE_TOKENS)))
 
 
 def main() -> int:
@@ -769,61 +795,66 @@ def main() -> int:
     mask = raw > 127
 
     parallel = len(targets) > 1 and NUM_WORKERS_SPILLS > 1
-    print(f"=== Rendering {len(targets)} region(s) "
-          f"(svg={do_svg}, ao={do_ao}, hm={do_hm}, id={do_id}, "
-          f"roads={do_roads}, beaches={do_beaches}, "
-          f"split_layers={do_split_layers}, "
-          f"workers={NUM_WORKERS_SPILLS if parallel else 1}) ===")
-
-    if parallel:
-        def _cmd(blend: Path) -> List[str]:
-            argv = [sys.executable, str(Path(__file__).resolve()), blend.stem]
-            if do_svg:
-                argv.append("-svg")
-            if do_ao:
-                argv.append("-ao")
-            if do_hm:
-                argv.append("-hm")
-            if do_id:
-                argv.append("-id")
-            if do_roads:
-                argv.append("-r")
-            if do_beaches:
-                argv.append("-b")
-            if do_split_layers:
-                argv.append("-sl")
-            return argv
-
-        failed_items = run_parallel_subprocesses(
-            targets, _cmd,
-            workers=NUM_WORKERS_SPILLS,
-            label_fn=lambda b: b.stem,
-        )
-        if failed_items:
-            names = [b.stem for b in failed_items]
-            print(f"\n{len(names)} region(s) had issues: {', '.join(names)}")
-            return 1
-        print(f"\n=== SUCCESS ===")
-        return 0
-
-    failed: List[str] = []
     total = len(targets)
-    for i, blend in enumerate(targets, 1):
-        try:
-            if not render_one(blend, mask, do_ao, do_hm, do_id,
-                              do_roads, do_beaches, do_split_layers,
-                              do_svg,
-                              region_idx=i, region_total=total):
+    title = (
+        f"Rendering {total} region(s) "
+        f"(svg={do_svg}, ao={do_ao}, hm={do_hm}, id={do_id}, "
+        f"roads={do_roads}, beaches={do_beaches}, "
+        f"split_layers={do_split_layers})"
+    )
+
+    with ScriptTUI(title=title, total=total) as tui:
+        if parallel:
+            def _cmd(blend: Path) -> List[str]:
+                argv = [sys.executable, str(Path(__file__).resolve()), blend.stem]
+                if do_svg:
+                    argv.append("-svg")
+                if do_ao:
+                    argv.append("-ao")
+                if do_hm:
+                    argv.append("-hm")
+                if do_id:
+                    argv.append("-id")
+                if do_roads:
+                    argv.append("-r")
+                if do_beaches:
+                    argv.append("-b")
+                if do_split_layers:
+                    argv.append("-sl")
+                return argv
+
+            failed_items = run_parallel_subprocesses(
+                targets, _cmd,
+                workers=NUM_WORKERS_SPILLS, tui=tui,
+                label_fn=lambda b: b.stem,
+            )
+            if failed_items:
+                names = [b.stem for b in failed_items]
+                tui.error(f"{len(names)} region(s) had issues: {', '.join(names)}")
+                return 1
+            tui.log("=== SUCCESS ===")
+            return 0
+
+        failed: List[str] = []
+        for region_idx, blend in enumerate(targets, 1):
+            tui.set_description(blend.stem)
+            try:
+                if not render_one(blend, mask, do_ao, do_hm, do_id,
+                                  do_roads, do_beaches, do_split_layers,
+                                  do_svg,
+                                  region_idx=region_idx, region_total=total):
+                    failed.append(blend.stem)
+            except Exception as exc:
+                tui.error(f"while rendering {blend.stem}: {exc}")
                 failed.append(blend.stem)
-        except Exception as exc:
-            print(f"ERROR while rendering {blend.stem}: {exc}")
-            failed.append(blend.stem)
+            tui.advance()
 
-    if failed:
-        print(f"\n{len(failed)} region(s) had issues: {', '.join(failed)}")
-        return 1
+        if failed:
+            tui.error(f"{len(failed)} region(s) had issues: {', '.join(failed)}")
+            return 1
 
-    print(f"\n=== SUCCESS ===")
+        tui.log("=== SUCCESS ===")
+
     return 0
 
 

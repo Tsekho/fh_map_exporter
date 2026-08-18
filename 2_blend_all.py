@@ -13,6 +13,8 @@ from typing import List, Optional, Set
 from utils.config import CENTRES_FILE, EXPORT_DIR, JSON_DIR, NUM_WORKERS
 from utils.map import Map
 from utils.parallel import run_parallel_subprocesses
+from utils.prompt import is_interactive, select
+from utils.tui import ScriptTUI
 
 
 def _load_region_keys() -> Set[str]:
@@ -37,16 +39,7 @@ def _list_maps() -> List[str]:
     )
 
 
-def pick_map_interactive() -> Optional[List[str]]:
-    if not JSON_DIR.is_dir():
-        print(f"ERROR: {JSON_DIR} not found")
-        return None
-
-    maps = _list_maps()
-    if not maps:
-        print(f"ERROR: no JSON files found in {JSON_DIR}")
-        return None
-
+def _pick_map_fallback(maps: List[str]) -> Optional[List[str]]:
     print("Available maps:")
     print("    0. All maps")
     for i, name in enumerate(maps, 1):
@@ -63,6 +56,25 @@ def pick_map_interactive() -> Optional[List[str]]:
         elif raw in maps:
             return [raw]
         print("  Invalid selection, try again.")
+
+
+def pick_map_interactive() -> Optional[List[str]]:
+    if not JSON_DIR.is_dir():
+        print(f"ERROR: {JSON_DIR} not found")
+        return None
+
+    maps = _list_maps()
+    if not maps:
+        print(f"ERROR: no JSON files found in {JSON_DIR}")
+        return None
+
+    if not is_interactive():
+        return _pick_map_fallback(maps)
+
+    idx = select("Select map", ["All maps"] + maps)
+    if idx is None:
+        return None
+    return maps if idx == 0 else [maps[idx - 1]]
 
 
 def main() -> int:
@@ -103,44 +115,49 @@ def main() -> int:
         terrain = not args.no_terrain
 
     parallel = len(map_names) > 1 and NUM_WORKERS > 1
-    print(f"=== Building {len(map_names)} map(s) "
-          f"(terrain={terrain}, workers={NUM_WORKERS if parallel else 1}) ===")
-
-    if parallel:
-        def _cmd(name: str) -> List[str]:
-            argv = [sys.executable, str(Path(__file__).resolve()), name]
-            if not terrain:
-                argv.append("-nt")
-            return argv
-
-        failed = run_parallel_subprocesses(map_names, _cmd, workers=NUM_WORKERS)
-        if failed:
-            print(f"\n{len(failed)} map(s) failed: {', '.join(failed)}")
-            return 1
-        print(f"\n=== SUCCESS ===")
-        return 0
-
-    errors: List[str] = []
     total = len(map_names)
-    w = len(str(total))
-    for i, name in enumerate(map_names, 1):
-        json_path = JSON_DIR / f"{name}.json"
-        if not json_path.exists():
-            print(f"ERROR: JSON not found: {json_path}")
-            errors.append(name)
-            continue
-        print(f"\n=== [{i:>{w}}/{total}] {name} ===")
-        try:
-            Map(str(json_path), str(EXPORT_DIR)).blend(terrain=terrain)
-        except Exception as exc:
-            print(f"ERROR while processing {name}: {exc}")
-            errors.append(name)
+    title = f"Building {total} map(s) (terrain={terrain})"
 
-    if errors:
-        print(f"\n{len(errors)} map(s) failed: {', '.join(errors)}")
-        return 1
+    with ScriptTUI(title=title, total=total) as tui:
+        if parallel:
+            def _cmd(name: str) -> List[str]:
+                argv = [sys.executable, str(Path(__file__).resolve()), name]
+                if not terrain:
+                    argv.append("-nt")
+                return argv
 
-    print(f"\n=== SUCCESS ===")
+            failed = run_parallel_subprocesses(
+                map_names, _cmd, workers=NUM_WORKERS, tui=tui,
+            )
+            if failed:
+                tui.error(f"{len(failed)} map(s) failed: {', '.join(failed)}")
+                return 1
+            tui.log("=== SUCCESS ===")
+            return 0
+
+        errors: List[str] = []
+        for name in map_names:
+            json_path = JSON_DIR / f"{name}.json"
+            if not json_path.exists():
+                tui.error(f"JSON not found: {json_path}")
+                errors.append(name)
+                tui.advance()
+                continue
+            tui.set_description(name)
+            tui.log(f"--- {name} ---")
+            try:
+                Map(str(json_path), str(EXPORT_DIR)).blend(terrain=terrain)
+            except Exception as exc:
+                tui.error(f"while processing {name}: {exc}")
+                errors.append(name)
+            tui.advance()
+
+        if errors:
+            tui.error(f"{len(errors)} map(s) failed: {', '.join(errors)}")
+            return 1
+
+        tui.log("=== SUCCESS ===")
+
     return 0
 
 

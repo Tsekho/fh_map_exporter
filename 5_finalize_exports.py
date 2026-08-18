@@ -50,6 +50,10 @@ from utils.config import (
     FLY_ALERT_MIN_M,
     FLY_ALERT_MAX_M,
 )
+from utils.tui import ScriptTUI
+from utils.tui import log as tui_log
+from utils.tui import step as tui_step
+from utils.tui import warn as tui_warn
 
 
 # Output subdirectories inside FINAL_DIR.
@@ -60,39 +64,13 @@ ASSEMBLY_DIR = "assembly"
 CONTOURS_BLUR_KSIZE = 3
 
 
-class _StepLogger:
-    """Running "[i/N] ..." step counter with uniform alignment."""
-
-    def __init__(self) -> None:
-        self.total = 0
-        self.i = 0
-
-    def set_total(self, total: int) -> None:
-        self.total = max(total, 1)
-
-    @property
-    def _w(self) -> int:
-        return len(str(self.total))
-
-    def step(self, msg: str) -> None:
-        self.i += 1
-        print(f"[{self.i:>{self._w}}/{self.total}] {msg}")
-
-    def saved(self, path: Path) -> None:
-        """Report a save as a step. Path is shown relative to FINAL_DIR."""
-        try:
-            short = path.relative_to(FINAL_DIR).as_posix()
-        except ValueError:
-            short = path.name
-        self.step(f"saved  {short}")
-
-    def info(self, msg: str) -> None:
-        """Non-counted informational line, indented to match step output."""
-        pad = " " * (self._w * 2 + 4)
-        print(f"{pad}{msg}")
-
-
-LOG = _StepLogger()
+def _saved(path: Path) -> None:
+    """Report a save as a progress step. Path is shown relative to FINAL_DIR."""
+    try:
+        short = path.relative_to(FINAL_DIR).as_posix()
+    except ValueError:
+        short = path.name
+    tui_step(f"saved  {short}")
 
 
 def load_centres() -> Dict[str, Tuple[int, int]]:
@@ -218,16 +196,20 @@ def stitch(
     canvas = np.zeros(shape, dtype=dtype)
     total = len(centres)
     placed = 0
+    last_logged = time.monotonic()
 
     for i, (name, (cx, cy)) in enumerate(centres.items(), 1):
-        print(f"  {i}/{total}", end="\r")
+        now = time.monotonic()
+        if now - last_logged >= 0.5 or i == total:
+            tui_log(f"  stitching {i}/{total}")
+            last_logged = now
         tile_path = tile_map.get(name.lower())
         if tile_path is None:
             continue
 
         tile = cv2.imread(str(tile_path), read_flag)
         if tile is None:
-            print(f"\n  [WARN] unreadable tile: {tile_path}")
+            tui_warn(f"  unreadable tile: {tile_path}")
             continue
 
         if channels == 1 and tile.ndim == 3:
@@ -250,7 +232,7 @@ def stitch(
         np.maximum(dst, tile, out=dst)
         placed += 1
 
-    print(f"  {total}/{total}  ({placed} tiles placed)")
+    tui_log(f"  stitched {total}/{total}  ({placed} tiles placed)")
     return canvas
 
 
@@ -265,10 +247,10 @@ def stitch_heightmap_landscape(
     width: int,
 ) -> np.ndarray | None:
     if not HM_LANDSCAPE_DIR.is_dir():
-        print(f"  [WARN] {HM_LANDSCAPE_DIR} not found; "
-              f"skipping landscape heightmap products")
+        tui_warn(f"  {HM_LANDSCAPE_DIR} not found; "
+                 f"skipping landscape heightmap products")
         return None
-    print(f"\n=== stitching heightmap_landscape ===")
+    tui_log("\n=== stitching heightmap_landscape ===")
     hm_map = _build_tile_map(HM_LANDSCAPE_DIR)
     return stitch(
         hm_map, centres, mask, height, width,
@@ -297,7 +279,7 @@ def build_fly_alert(
     rocks_cov: np.ndarray | None,
     out_path: Path,
 ) -> None:
-    print("  building fly_alert...")
+    tui_log("  building fly_alert...")
     void = raw_landscape == 0
     meters = (raw_landscape.astype(np.float32) - 32768.0) / 100.0
     denom = max(FLY_ALERT_MAX_M - FLY_ALERT_MIN_M, 1e-6)
@@ -311,8 +293,8 @@ def build_fly_alert(
         ).astype(np.uint8)
     pattern = cv2.imread(str(FLY_ALERT_PATTERN_FILE), cv2.IMREAD_UNCHANGED)
     if pattern is None:
-        print(f"  [WARN] {FLY_ALERT_PATTERN_FILE} not found; "
-              f"falling back to solid white fly_alert")
+        tui_warn(f"  {FLY_ALERT_PATTERN_FILE} not found; "
+                 f"falling back to solid white fly_alert")
         fly_rgba = np.zeros((height, width, 4), dtype=np.uint8)
         fly_rgba[..., 0:3] = 255
         fly_rgba[..., 3] = fly_alert
@@ -332,7 +314,7 @@ def build_fly_alert(
             (fly_rgba[..., 3].astype(np.uint16) * coef + 127) // 255
         ).astype(np.uint8)
     _write_rgba(fly_rgba, out_path)
-    LOG.saved(out_path)
+    _saved(out_path)
 
 
 def build_contour(
@@ -342,7 +324,7 @@ def build_contour(
     width: int,
 ) -> np.ndarray:
     """Return the contour RGBA array (black lines with alpha)."""
-    print("  building contour...")
+    tui_log("  building contour...")
     void = raw_landscape == 0
     step = (raw_landscape // 250).astype(np.int32)
     contour = np.zeros(step.shape, dtype=bool)
@@ -365,9 +347,9 @@ def stitch_heightmap_water(
     width: int,
 ) -> np.ndarray | None:
     if not HM_WATER_DIR.is_dir():
-        print(f"  [WARN] {HM_WATER_DIR} not found; skipping heightmap_simple")
+        tui_warn(f"  {HM_WATER_DIR} not found; skipping heightmap_simple")
         return None
-    print(f"\n=== stitching heightmap_water ===")
+    tui_log("\n=== stitching heightmap_water ===")
     hm_map = _build_tile_map(HM_WATER_DIR)
     return stitch(
         hm_map, centres, mask, height, width,
@@ -380,13 +362,13 @@ def build_heightmap_simple(
     world_alpha: np.ndarray,
     out_path: Path,
 ) -> None:
-    print("  building heightmap_simple...")
+    tui_log("  building heightmap_simple...")
     void = raw_water == 0
     meters = (raw_water.astype(np.float32) - 32768.0) / 100.0
     simple = np.clip(np.round(60.0 + meters * 2.0), 0, 255).astype(np.uint8)
     simple[void] = 0
     _write_with_alpha(simple, world_alpha, out_path)
-    LOG.saved(out_path)
+    _saved(out_path)
 
 
 def _hex_to_bgra(hex_str: str) -> Tuple[int, int, int, int]:
@@ -409,14 +391,14 @@ def build_dive_alert(
     range the BGRA colour is interpolated linearly between the range's two
     stops; depths past the last range stay transparent. Alpha is gated by
     water_cov and the world hex mask."""
-    print("  building dive_alert...")
+    tui_log("  building dive_alert...")
     valid = (raw_landscape != 0) & (raw_water != 0)
     land_m = (raw_landscape.astype(np.float32) - 32768.0) / 100.0
     water_m = (raw_water.astype(np.float32) - 32768.0) / 100.0
     depth = water_m - land_m
     valid &= depth > 0
     if not valid.any():
-        print("  [info] no submerged pixels; dive_alert skipped")
+        tui_log("  [info] no submerged pixels; dive_alert skipped")
         return
 
     height, width = depth.shape
@@ -456,7 +438,7 @@ def build_dive_alert(
     rgba[..., 0:3] = np.clip(np.round(bgra_f[..., 0:3]), 0, 255).astype(np.uint8)
     rgba[..., 3] = np.clip(np.round(alpha), 0, 255).astype(np.uint8)
     _write_rgba(rgba, out_path)
-    LOG.saved(out_path)
+    _saved(out_path)
 
 
 # ------------------------------------------------------------------------------
@@ -541,7 +523,7 @@ def build_shades(
     alpha-betting into an RGB canvas. Returns (shades_bgr, shades_alpha)
     or None when LAYERS_DIR is missing / empty."""
     if not LAYERS_DIR.is_dir():
-        print(f"\n[WARN] {LAYERS_DIR} not found; no per-layer stitching done")
+        tui_warn(f"{LAYERS_DIR} not found; no per-layer stitching done")
         return None
     layer_dirs = sorted(d for d in LAYERS_DIR.iterdir() if d.is_dir())
     if not layer_dirs:
@@ -556,7 +538,7 @@ def build_shades(
 
     for layer_dir in layer_dirs:
         layer = layer_dir.name
-        print(f"\n=== stitching layer: {layer} ===")
+        tui_log(f"\n=== stitching layer: {layer} ===")
         tile_map = _build_tile_map(layer_dir)
         canvas = stitch(
             tile_map, centres, mask, height, width,
@@ -565,7 +547,7 @@ def build_shades(
         if claim_mask is not None:
             canvas = canvas * claim_mask.astype(np.uint8)
         color = _assign_layer_color(layer, LAYER_COLORS, used_colors, rng)
-        print(f"  color: BGR{color}")
+        tui_log(f"  color: BGR{color}")
         win = canvas > winner_alpha
         if win.any():
             shades[win] = color
@@ -588,8 +570,8 @@ def build_shades(
             src_y[1:] = ys; src_x[1:] = xs
             lab = np.clip(labels[need_fill].astype(np.int64), 1, ys.size)
             shades[need_fill] = shades[src_y[lab], src_x[lab]]
-            print(f"  filled {n_need} unassigned pixel(s) "
-                  f"with nearest shade colour (blur bleed guard)")
+            tui_log(f"  filled {n_need} unassigned pixel(s) "
+                    f"with nearest shade colour (blur bleed guard)")
 
     if SHADES_BLUR_KSIZE and SHADES_BLUR_KSIZE > 1:
         k = int(SHADES_BLUR_KSIZE)
@@ -641,7 +623,7 @@ def build_base_layer(
       + ao                      (multiply)
     """
     if terrain_recolor is None:
-        print("  [WARN] terrain_recolor unavailable; skipping base_layer")
+        tui_warn("  terrain_recolor unavailable; skipping base_layer")
         return
 
     height, width = world_alpha.shape
@@ -674,7 +656,7 @@ def build_base_layer(
     base = np.clip(base, 0, 255).astype(np.uint8)
     rgba = np.dstack([base, world_alpha])
     _write_rgba(rgba, out_path)
-    LOG.saved(out_path)
+    _saved(out_path)
 
 
 def _load_svg_layer(name: str) -> np.ndarray | None:
@@ -722,7 +704,7 @@ def build_rdz(height: int, width: int, out_path: Path) -> None:
     """rdz_pattern with svg_layers/rdz_grace punching holes in its alpha."""
     pattern = cv2.imread(str(RDZ_PATTERN_FILE), cv2.IMREAD_UNCHANGED)
     if pattern is None:
-        print(f"  [WARN] {RDZ_PATTERN_FILE} not found; skipping rdz")
+        tui_warn(f"  {RDZ_PATTERN_FILE} not found; skipping rdz")
         return
     if pattern.ndim == 2:
         pattern = cv2.cvtColor(pattern, cv2.COLOR_GRAY2BGRA)
@@ -740,7 +722,7 @@ def build_rdz(height: int, width: int, out_path: Path) -> None:
         pattern = _mul_alpha(pattern, keep)
 
     _write_rgba(pattern, out_path)
-    LOG.saved(out_path)
+    _saved(out_path)
 
 
 def build_ranges(
@@ -764,17 +746,17 @@ def build_ranges(
     for name, gate in layers_gates:
         img = _load_svg_layer(name)
         if img is None:
-            LOG.info(f"[skip] ranges: svg_layers/{name}.png missing")
+            tui_log(f"[skip] ranges: svg_layers/{name}.png missing")
             continue
         if gate is not None:
             img = _mul_alpha(img, gate)
         result = _composite_over(result, img)
         any_hit = True
     if not any_hit:
-        print("  [WARN] no range svg_layers available; skipping ranges")
+        tui_warn("  no range svg_layers available; skipping ranges")
         return
     _write_rgba(result, out_path)
-    LOG.saved(out_path)
+    _saved(out_path)
 
 
 def build_contours_assembly(
@@ -797,29 +779,42 @@ def build_contours_assembly(
     rgba = np.zeros_like(contour_rgba)
     rgba[..., 3] = out_alpha
     _write_rgba(rgba, out_path)
-    LOG.saved(out_path)
+    _saved(out_path)
 
 
 # ------------------------------------------------------------------------------
 #  Main
 # ------------------------------------------------------------------------------
 
-def main() -> int:
-    t0 = time.time()
+def _stitch_then_alpha(
+    centres: Dict[str, Tuple[int, int]],
+    mask: np.ndarray,
+    height: int,
+    width: int,
+    world_alpha: np.ndarray,
+    label: str,
+    src_dir: Path,
+    *,
+    channels: int,
+    read_flag: int,
+    out_rel: str,
+) -> np.ndarray | None:
+    if not src_dir.is_dir():
+        tui_log(f"[skip] {label}: source dir not found ({src_dir.name})")
+        return None
+    tui_log(f"\n=== stitching {label} ===")
+    tile_map = _build_tile_map(src_dir)
+    canvas = stitch(tile_map, centres, mask, height, width,
+                    channels=channels, dtype=np.uint8,
+                    read_flag=read_flag)
+    out_path = FINAL_DIR / out_rel
+    _write_with_alpha(canvas, world_alpha, out_path)
+    _saved(out_path)
+    return canvas
 
-    try:
-        centres = load_centres()
-        mask = load_mask()
-    except FileNotFoundError as exc:
-        print(f"ERROR: {exc}")
-        return 1
 
-    height, width = canvas_size(centres)
-    print(f"=== Finalizing exports ({width}x{height} px, {len(centres)} regions) ===")
-
-    FINAL_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Best-effort pre-count for "[i/N]" prefixes.
+def _estimate_step_count() -> int:
+    """Best-effort pre-count of the TUI progress bar's total steps."""
     est = 0
     if AO_DIR.is_dir():            est += 1  # technical/ao
     if ROADS_DIR.is_dir():         est += 1  # assembly/roads
@@ -838,44 +833,67 @@ def main() -> int:
     if HM_LANDSCAPE_DIR.is_dir() and HM_WATER_DIR.is_dir():
         est += 1  # dive_alert
     est += 3  # base_layer, rdz, ranges (may skip)
-    LOG.set_total(est)
+    return est
 
-    world_alpha = _compute_world_alpha(centres, mask, height, width)
 
-    def _stitch_then_alpha(
-        label: str,
-        src_dir: Path,
-        *,
-        channels: int,
-        read_flag: int,
-        out_rel: str,
-    ) -> np.ndarray | None:
-        if not src_dir.is_dir():
-            LOG.info(f"[skip] {label}: source dir not found ({src_dir.name})")
-            return None
-        print(f"\n=== stitching {label} ===")
-        tile_map = _build_tile_map(src_dir)
-        canvas = stitch(tile_map, centres, mask, height, width,
-                        channels=channels, dtype=np.uint8,
-                        read_flag=read_flag)
-        out_path = FINAL_DIR / out_rel
+def _stitch_id_coverage(
+    centres: Dict[str, Tuple[int, int]],
+    mask: np.ndarray,
+    height: int,
+    width: int,
+    world_alpha: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    id_coverage: Dict[str, np.ndarray] = {}
+    if not ID_DIR.is_dir():
+        tui_warn(f"\n{ID_DIR} not found; per-category ID coverage skipped")
+        return id_coverage
+
+    cat_dirs = sorted(d for d in ID_DIR.iterdir() if d.is_dir())
+    for cat_dir in cat_dirs:
+        cat = cat_dir.name
+        tui_log(f"\n=== stitching id/{cat} ===")
+        tile_map = _build_tile_map(cat_dir)
+        if not tile_map:
+            tui_log(f"  [skip] no tiles in {cat_dir}")
+            continue
+        canvas = stitch(
+            tile_map, centres, mask, height, width,
+            channels=1, dtype=np.uint8,
+            read_flag=cv2.IMREAD_GRAYSCALE,
+        )
+        id_coverage[cat] = canvas
+        out_path = FINAL_DIR / "id" / f"{cat}.png"
         _write_with_alpha(canvas, world_alpha, out_path)
-        LOG.saved(out_path)
-        return canvas
+        _saved(out_path)
+    return id_coverage
+
+
+def _run(
+    centres: Dict[str, Tuple[int, int]],
+    mask: np.ndarray,
+    height: int,
+    width: int,
+) -> None:
+    """Stitch every step-4 bake and assemble the final composites. Assumes
+    a ScriptTUI is already active (see main())."""
+    world_alpha = _compute_world_alpha(centres, mask, height, width)
 
     # -- technical/ao (also reused for base_layer multiply) --
     ao_canvas = _stitch_then_alpha(
+        centres, mask, height, width, world_alpha,
         "ao", AO_DIR, channels=1, read_flag=cv2.IMREAD_GRAYSCALE,
         out_rel=f"{TECHNICAL_DIR}/ao.png",
     )
 
     # -- assembly/roads & assembly/beaches --
     _stitch_then_alpha(
+        centres, mask, height, width, world_alpha,
         "roads", ROADS_DIR,
         channels=4, read_flag=cv2.IMREAD_UNCHANGED,
         out_rel=f"{ASSEMBLY_DIR}/roads.png",
     )
     _stitch_then_alpha(
+        centres, mask, height, width, world_alpha,
         "beaches", BEACHES_DIR,
         channels=4, read_flag=cv2.IMREAD_UNCHANGED,
         out_rel=f"{ASSEMBLY_DIR}/beaches.png",
@@ -884,63 +902,44 @@ def main() -> int:
     # -- assembly/bridges_aim (procedural per-region tiles, own folder) --
     if BRIDGES_AIM_DIR.is_dir():
         _stitch_then_alpha(
+            centres, mask, height, width, world_alpha,
             "bridges_aim", BRIDGES_AIM_DIR,
             channels=4, read_flag=cv2.IMREAD_UNCHANGED,
             out_rel=f"{ASSEMBLY_DIR}/bridges_aim.png",
         )
     else:
-        print(f"\n[WARN] {BRIDGES_AIM_DIR} not found; "
-              f"skipping bridges_aim stitching")
+        tui_warn(f"\n{BRIDGES_AIM_DIR} not found; "
+                 f"skipping bridges_aim stitching")
 
     # -- split_layers/<layer>.png (unchanged location) --
     if SPLIT_LAYERS_DIR.is_dir():
         for layer in SPLIT_LAYERS:
             src = SPLIT_LAYERS_DIR / layer
             _stitch_then_alpha(
+                centres, mask, height, width, world_alpha,
                 f"split_layers/{layer}", src,
                 channels=4, read_flag=cv2.IMREAD_UNCHANGED,
                 out_rel=f"split_layers/{layer}.png",
             )
     else:
-        print(f"\n[WARN] {SPLIT_LAYERS_DIR} not found; "
-              f"skipping split_layer stitching")
+        tui_warn(f"\n{SPLIT_LAYERS_DIR} not found; "
+                 f"skipping split_layer stitching")
 
     # -- svg_layers/<layer>.png (unchanged location; consumed below) --
     if SVG_LAYERS_DIR.is_dir():
         for layer in SVG_LAYERS:
             src = SVG_LAYERS_DIR / layer
             _stitch_then_alpha(
+                centres, mask, height, width, world_alpha,
                 f"svg_layers/{layer}", src,
                 channels=4, read_flag=cv2.IMREAD_UNCHANGED,
                 out_rel=f"svg_layers/{layer}.png",
             )
     else:
-        print(f"\n[WARN] {SVG_LAYERS_DIR} not found; "
-              f"skipping svg_layer stitching")
+        tui_warn(f"\n{SVG_LAYERS_DIR} not found; "
+                 f"skipping svg_layer stitching")
 
-    # -- id/<cat>.png (unchanged location) --
-    id_coverage: Dict[str, np.ndarray] = {}
-    if not ID_DIR.is_dir():
-        print(f"\n[WARN] {ID_DIR} not found; per-category ID coverage skipped")
-    else:
-        cat_dirs = sorted(d for d in ID_DIR.iterdir() if d.is_dir())
-        for cat_dir in cat_dirs:
-            cat = cat_dir.name
-            print(f"\n=== stitching id/{cat} ===")
-            tile_map = _build_tile_map(cat_dir)
-            if not tile_map:
-                print(f"  [skip] no tiles in {cat_dir}")
-                continue
-            canvas = stitch(
-                tile_map, centres, mask, height, width,
-                channels=1, dtype=np.uint8,
-                read_flag=cv2.IMREAD_GRAYSCALE,
-            )
-            id_coverage[cat] = canvas
-            out_path = FINAL_DIR / "id" / f"{cat}.png"
-            _write_with_alpha(canvas, world_alpha, out_path)
-            LOG.saved(out_path)
-
+    id_coverage = _stitch_id_coverage(centres, mask, height, width, world_alpha)
     terrain_cov = id_coverage.get("terrain")
     water_cov = id_coverage.get("water")
     rocks_cov = id_coverage.get("rocks")
@@ -969,7 +968,7 @@ def main() -> int:
     highs = lows = None
     contour_rgba = None
     if raw_landscape is not None:
-        print(f"\n=== deriving heightmap_landscape products ===")
+        tui_log("\n=== deriving heightmap_landscape products ===")
         highs, lows = compute_highs_lows(raw_landscape)
         build_fly_alert(
             raw_landscape, height, width, rocks_cov,
@@ -980,11 +979,11 @@ def main() -> int:
         )
         contour_out = FINAL_DIR / TECHNICAL_DIR / "contour.png"
         _write_rgba(contour_rgba, contour_out)
-        LOG.saved(contour_out)
+        _saved(contour_out)
 
     raw_water = stitch_heightmap_water(centres, mask, height, width)
     if raw_water is not None:
-        print(f"\n=== deriving heightmap_water products ===")
+        tui_log("\n=== deriving heightmap_water products ===")
         build_heightmap_simple(
             raw_water, world_alpha,
             FINAL_DIR / TECHNICAL_DIR / "heightmap_simple.png",
@@ -1000,12 +999,12 @@ def main() -> int:
             FINAL_DIR / ASSEMBLY_DIR / "dive_alert.png",
         )
     else:
-        print("  [WARN] missing heightmap/water coverage; skipping dive_alert")
+        tui_warn("  missing heightmap/water coverage; skipping dive_alert")
 
     del raw_landscape, raw_water
 
     # -- in-memory intermediates for base_layer --
-    print(f"\n=== assembling base_layer inputs ===")
+    tui_log("\n=== assembling base_layer inputs ===")
     terrain_recolor = (
         build_terrain_recolor(id_coverage, world_alpha, height, width)
         if id_coverage else None
@@ -1039,7 +1038,25 @@ def main() -> int:
         FINAL_DIR / ASSEMBLY_DIR / "ranges.png",
     )
 
-    print(f"\n=== SUCCESS (in {time.time() - t0:.2f}s) ===")
+
+def main() -> int:
+    t0 = time.time()
+
+    try:
+        centres = load_centres()
+        mask = load_mask()
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    height, width = canvas_size(centres)
+    FINAL_DIR.mkdir(parents=True, exist_ok=True)
+
+    title = f"Finalizing exports ({width}x{height} px, {len(centres)} regions)"
+    with ScriptTUI(title=title, total=_estimate_step_count()):
+        _run(centres, mask, height, width)
+        tui_log(f"\n=== SUCCESS (in {time.time() - t0:.2f}s) ===")
+
     return 0
 
 

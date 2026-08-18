@@ -86,6 +86,36 @@ NUM_WORKERS = 6
 NUM_WORKERS_SPILLS = 3
 
 
+# ------------------------------------------------------------------------------
+#  Shared TUI (utils/tui.py)
+# ------------------------------------------------------------------------------
+
+# Width, in characters, of the "[####----]" fill portion of the bottom
+# progress bar (excludes the description/count/elapsed-time text).
+TUI_BAR_WIDTH = 30
+# Seconds between heartbeat redraws of the progress bar, so elapsed time
+# keeps ticking during long silent phases (e.g. a multi-minute bake with
+# no log/advance calls in between).
+TUI_TICK_INTERVAL_S = 1.0
+
+# Exponential-moving-average weight given to each newly-completed item's
+# duration when estimating ETA (0..1). Higher = ETA reacts faster to
+# recent items but is noisier; lower = smoother but slower to adapt when
+# per-item cost changes (e.g. a much bigger region partway through a run).
+TUI_ETA_SMOOTHING = 0.3
+
+
+# ------------------------------------------------------------------------------
+#  Shared prompt menus (utils/prompt.py)
+# ------------------------------------------------------------------------------
+
+# Maximum number of option rows shown at once in select()/multiselect()
+# menus; longer lists scroll to keep the highlighted row in view. Also
+# capped by the terminal's actual height at render time, so this is a
+# ceiling, not a guarantee.
+PROMPT_MAX_VISIBLE_OPTIONS = 10
+
+
 FOXHOLE_PAK = Path(
     r"C:\Program Files (x86)\Steam\steamapps\common"
     r"\Foxhole\War\Content\Paks\War-WindowsNoEditor.pak"
