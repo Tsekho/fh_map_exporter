@@ -52,6 +52,6 @@ TheFingersHex.json        2aba357a
 TyrantFoothillsHex.json   fd64bd49
 UmbralWildwoodHex.json    1209b4a8
 ViperPitHex.json          91b72032
-WeatheredExpanseHex.json  44126ef7
+WeatheredExpanseHex.json  16ec5e51
 WestgateHex.json          38fa7bec
 WrestaHex.json            fca962cd
