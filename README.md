@@ -86,6 +86,17 @@ Clears `export/` and runs `Exporter.exe`. Writes:
 python 1_export.py
 ```
 
+### Interactive Prompts
+
+Steps 2-6 without a target argument open an arrow-key picker with
+everything ticked: up/down to move, space to tick one on or off, `a`/`n`
+for all/none, enter to run, esc to cancel. Enter straight away does what
+`-a` does. Selected items get a progress bar each (one per worker in a
+parallel run); `-v` shows the full log instead of just warnings.
+
+Piped and non-TTY runs fall back to a numbered prompt and plain output.
+`FH_NO_TUI=1` (or `NO_COLOR`) forces that fallback in a terminal.
+
 ### Step 2 - Generate Blender Scenes
 
 ```bash
@@ -154,15 +165,37 @@ Tunables in `utils/config.py`: `TERRAIN_WHITELIST` (categories that
 participate in ao/hm/id), `SPLIT_LAYERS`, `SVG_LAYERS`, `SPLINE_CATEGORIES`,
 `SPLINE_COLORS`, `SPLINE_LAYER_SSAA`, `ID_SSAA`.
 
+Performance knobs for this step: see [Parallel Execution](#parallel-execution).
+
 ### Step 5 - Finalize Exports
 
 Stitches every step-4 bake into world-sized PNGs, derives heightmap
 products, and assembles composites consumed by the map mod generator.
 All assembly work is in-memory; only the listed files are written.
 
+Each output below is a named stage. With no arguments the same arrow-key
+picker as steps 2-4 opens with every stage ticked; names can also be given
+on the command line. A stage whose outputs are newer than its inputs is
+reported as up to date and skipped, so re-running after changing one bake
+only redoes what depends on it. `-f` rebuilds regardless.
+
 ```bash
-python 5_finalize_exports.py
+python 5_finalize_exports.py                 # pick outputs interactively
+python 5_finalize_exports.py base_layer rdz  # named stages
+python 5_finalize_exports.py -a              # every stage
+python 5_finalize_exports.py -a -f           # ... and ignore the mtime check
 ```
+
+Stage names: `ao`, `roads`, `beaches`, `bridges_aim`, `split_layers`,
+`svg_layers`, `id`, `fly_alert`, `contour`, `heightmap_simple`,
+`dive_alert`, `base_layer`, `contours`, `rdz`, `ranges`.
+
+Shared intermediates (world alpha, ID coverage, heightmaps, shades) are
+stitched on first use and freed once no remaining stage needs them, so
+asking for one stage only pays for that stage's inputs. Masks always come
+from the step-4 tiles; the only cross-stage file dependency is `rdz` and
+`ranges` reading the stitched `svg_layers`, which is pulled into the run
+when stale.
 
 Output layout (under `export/_final/`):
 
@@ -223,10 +256,26 @@ Output: `<input_stem>/<Region>.png` (created in the current directory).
 
 ## Parallel Execution
 
-Steps 2, 3, and 4 fan out to multiple subprocesses when more than one
-item is queued. Worker count is controlled by `NUM_WORKERS` and `NUM_WORKERS_SPILLS` in
-`utils/config.py`. Set it to `1` for serial execution.
-The fan-out logic lives in `utils/parallel.py`.
+Steps 2, 3, and 4 fan out to subprocesses when more than one item is
+queued; `utils/parallel.py` holds the fan-out. Worker count comes from
+`NUM_WORKERS` and `NUM_WORKERS_SPILLS` in `utils/config.py` - set to `1`
+for serial execution.
+
+Step 4 tuning:
+
+- `NUM_WORKERS_SPILLS` is bounded by **memory, not cores** - each worker
+  holds a region scene plus its BVH, and overshooting RAM pages.
+- `BAKE_ROW_THREADS` splits cores across workers (`0` = automatic). The
+  raycast bakes hold the GIL, so throughput comes from processes, not
+  threads.
+- `NUM_WORKERS_SVG` replaces the above for an SVG-only run, which never
+  opens a `.blend`.
+- `GPU_SERIALIZE_RENDERS` makes Cycles passes queue for the GPU via
+  `utils/gpu_lock.py` instead of thrashing it; `CYCLES_USE_CPU_WITH_GPU`
+  adds CPU devices, which only pays off for a lone render.
+- `BVH_CACHE_REUSE` shares one BVH between consecutive bakes over the same
+  objects. Disable it if `id/` output must be bit-identical - a reused
+  tree can tie-break coincident faces differently.
 
 ## Project Structure
 
@@ -256,6 +305,9 @@ The fan-out logic lives in `utils/parallel.py`.
 │   ├── svg_render.py           # SVG layer builder + cairosvg rasterizer
 │   ├── regions.py              # Region geometry, deep water, spill builder
 │   ├── parallel.py             # Subprocess fan-out helper
+│   ├── tui.py                  # Arrow-key pickers, prompts, progress bars
+│   ├── progress.py             # Trackers feeding the bars; worker log capture
+│   ├── gpu_lock.py             # Machine-wide lock serializing Cycles renders
 │   ├── region_centers.json     # World-space pixel coords of all regions
 │   ├── mask.png                # Per-region hex mask
 │   ├── fly_alert_pattern.png   # BGRA texture sampled by the fly_alert overlay

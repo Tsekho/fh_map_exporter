@@ -5,20 +5,36 @@ Writes to ``export/_final/``: ``technical/`` (ao, heightmap_simple, contour),
 rdz, ranges, bridges_aim), and verbatim ``id/``, ``split_layers/``,
 ``svg_layers/``.
 
+Each output is a named stage, built only when asked for and only when its
+inputs are newer than what is already on disk. Shared intermediates (the
+stitched ID coverage, heightmaps, world alpha) are built on first use and
+freed once no remaining stage needs them. Where one stage reads another's
+written output (rdz and ranges read the stitched svg_layers), the producer
+is pulled into the run when its files are missing or stale.
+
 Usage:
-    python 5_finalize_exports.py
+    python 5_finalize_exports.py                 # pick outputs interactively
+    python 5_finalize_exports.py base_layer rdz  # named stages
+    python 5_finalize_exports.py -a              # every stage
+    python 5_finalize_exports.py -a -f           # ... and rebuild regardless
 """
 
+import argparse
 import colorsys
 import json
+import os
 import random
 import sys
 import time
+import traceback
+from functools import cached_property
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+from utils import progress, tui
 
 from utils.config import (
     AO_DIR,
@@ -61,35 +77,18 @@ CONTOURS_BLUR_KSIZE = 3
 
 
 class _StepLogger:
-    """Running "[i/N] ..." step counter with uniform alignment."""
-
-    def __init__(self) -> None:
-        self.total = 0
-        self.i = 0
-
-    def set_total(self, total: int) -> None:
-        self.total = max(total, 1)
-
-    @property
-    def _w(self) -> int:
-        return len(str(self.total))
-
-    def step(self, msg: str) -> None:
-        self.i += 1
-        print(f"[{self.i:>{self._w}}/{self.total}] {msg}")
+    """Per-file reporting; only surfaces in -v runs and piped output."""
 
     def saved(self, path: Path) -> None:
-        """Report a save as a step. Path is shown relative to FINAL_DIR."""
+        """Report a save. Path is shown relative to FINAL_DIR."""
         try:
             short = path.relative_to(FINAL_DIR).as_posix()
         except ValueError:
             short = path.name
-        self.step(f"saved  {short}")
+        print(f"  saved  {short}")
 
     def info(self, msg: str) -> None:
-        """Non-counted informational line, indented to match step output."""
-        pad = " " * (self._w * 2 + 4)
-        print(f"{pad}{msg}")
+        print(f"  {msg}")
 
 
 LOG = _StepLogger()
@@ -177,6 +176,25 @@ def _compute_world_alpha(
     return alpha
 
 
+def _imwrite(img: np.ndarray, out_path: Path) -> None:
+    """Encode to a sibling temp file, then rename over the target.
+
+    A whole-world PNG takes seconds to write; interrupted in place it would
+    leave a truncated file with a fresh mtime, which up_to_date() would
+    trust. The rename is atomic, so a kill leaves either the previous
+    output or none -- both of which read as stale.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(".partial.png")
+    try:
+        if not cv2.imwrite(str(tmp), img):
+            raise OSError(f"cv2 failed to write {tmp}")
+        os.replace(tmp, out_path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def _write_with_alpha(
     canvas: np.ndarray,
     alpha: np.ndarray,
@@ -193,13 +211,11 @@ def _write_with_alpha(
     else:
         bgra = canvas.copy()
         bgra[..., 3] = np.minimum(bgra[..., 3], alpha)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out_path), bgra)
+    _imwrite(bgra, out_path)
 
 
 def _write_rgba(rgba: np.ndarray, out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out_path), rgba)
+    _imwrite(rgba, out_path)
 
 
 def stitch(
@@ -801,11 +817,480 @@ def build_contours_assembly(
 
 
 # ------------------------------------------------------------------------------
+#  Shared intermediates
+# ------------------------------------------------------------------------------
+
+class Ctx:
+    """Everything a stage might need, stitched on first use and cached, so
+    running one stage on its own only pays for that stage's inputs."""
+
+    def __init__(self, centres: Dict[str, Tuple[int, int]],
+                 mask: np.ndarray, height: int, width: int) -> None:
+        self.centres = centres
+        self.mask = mask
+        self.height = height
+        self.width = width
+
+    def _stitch_dir(self, label: str, src_dir: Path, *, channels: int,
+                    read_flag: int, dtype=np.uint8):
+        if not src_dir.is_dir():
+            LOG.info(f"[skip] {label}: source dir not found ({src_dir.name})")
+            return None
+        print(f"=== stitching {label} ===")
+        return stitch(_build_tile_map(src_dir), self.centres, self.mask,
+                      self.height, self.width, channels=channels,
+                      dtype=dtype, read_flag=read_flag)
+
+    @cached_property
+    def world_alpha(self) -> np.ndarray:
+        return _compute_world_alpha(self.centres, self.mask,
+                                    self.height, self.width)
+
+    @cached_property
+    def ao(self):
+        return self._stitch_dir("ao", AO_DIR, channels=1,
+                                read_flag=cv2.IMREAD_GRAYSCALE)
+
+    @cached_property
+    def id_coverage(self) -> Dict[str, np.ndarray]:
+        """{category: coverage} stitched from the per-region ID bakes."""
+        out: Dict[str, np.ndarray] = {}
+        if not ID_DIR.is_dir():
+            print(f"  [WARN] {ID_DIR} not found; ID coverage unavailable")
+            return out
+        for cat_dir in sorted(d for d in ID_DIR.iterdir() if d.is_dir()):
+            tile_map = _build_tile_map(cat_dir)
+            if not tile_map:
+                continue
+            print(f"=== stitching id/{cat_dir.name} ===")
+            out[cat_dir.name] = stitch(
+                tile_map, self.centres, self.mask, self.height, self.width,
+                channels=1, dtype=np.uint8, read_flag=cv2.IMREAD_GRAYSCALE,
+            )
+        return out
+
+    @cached_property
+    def raw_landscape(self):
+        return stitch_heightmap_landscape(self.centres, self.mask,
+                                          self.height, self.width)
+
+    @cached_property
+    def raw_water(self):
+        return stitch_heightmap_water(self.centres, self.mask,
+                                      self.height, self.width)
+
+    @cached_property
+    def highs_lows(self):
+        if self.raw_landscape is None:
+            return None, None
+        return compute_highs_lows(self.raw_landscape)
+
+    @cached_property
+    def contour_rgba(self):
+        if self.raw_landscape is None:
+            return None
+        terrain_cov = self.id_coverage.get("terrain")
+        world_terrain = (terrain_cov > 0) if terrain_cov is not None else None
+        return build_contour(self.raw_landscape, world_terrain,
+                             self.height, self.width)
+
+    @cached_property
+    def ground_u8(self) -> np.ndarray:
+        """Terrain coverage minus water, clipped to the world hexes."""
+        terrain_cov = self.id_coverage.get("terrain")
+        if terrain_cov is None:
+            return np.zeros((self.height, self.width), dtype=np.uint8)
+        water_cov = self.id_coverage.get("water")
+        if water_cov is not None:
+            non_water = (255 - water_cov).astype(np.uint16)
+            ground = ((terrain_cov.astype(np.uint16) * non_water + 127)
+                      // 255).astype(np.uint8)
+        else:
+            ground = terrain_cov.copy()
+        return np.minimum(ground, self.world_alpha)
+
+    @cached_property
+    def ground01(self) -> np.ndarray:
+        return self.ground_u8.astype(np.float32) / 255.0
+
+    @cached_property
+    def water01(self) -> np.ndarray:
+        water_cov = self.id_coverage.get("water")
+        if water_cov is None:
+            return np.zeros((self.height, self.width), dtype=np.float32)
+        return water_cov.astype(np.float32) / 255.0
+
+    def release_except(self, keep: Sequence[str]) -> None:
+        """Drop every cached canvas not in ``keep``. These are whole-world
+        images -- a stitched heightmap is half a gigabyte."""
+        cached = {name
+                  for klass in type(self).__mro__
+                  for name, value in vars(klass).items()
+                  if isinstance(value, cached_property)}
+        for name in list(self.__dict__):
+            if name in cached and name not in keep:
+                del self.__dict__[name]
+
+    @cached_property
+    def shades(self):
+        shade_alpha = (self.ground_u8
+                       if self.id_coverage.get("terrain") is not None
+                       else None)
+        return build_shades(self.centres, self.mask, self.height, self.width,
+                            shade_alpha)
+
+
+# ------------------------------------------------------------------------------
+#  Stages
+# ------------------------------------------------------------------------------
+
+def _final(rel: str) -> Path:
+    return FINAL_DIR / rel
+
+
+class Stage:
+    """One named output: what it writes, what it reads, how to build it."""
+
+    def __init__(self, name: str, describe: str,
+                 run: Callable[[Ctx], None],
+                 outputs: Callable[[], List[Path]],
+                 inputs: Callable[[], List[Path]],
+                 needs: Sequence[str] = (),
+                 requires: Sequence[str] = ()) -> None:
+        self.name = name
+        self.describe = describe
+        self.run = run
+        self.outputs = outputs
+        self.inputs = inputs
+        # Ctx attributes this stage may read; the rest are freed after it.
+        self.needs = tuple(needs)
+        # Stages whose written output this one reads, pulled into the run
+        # when their files are missing or stale.
+        self.requires = tuple(requires)
+
+    def up_to_date(self) -> bool:
+        """True when every output exists and no input has changed since. A
+        missing input dir counts as unchanged: there is nothing to redo."""
+        outs = self.outputs()
+        if not outs or not all(p.is_file() and p.stat().st_size
+                               for p in outs):
+            return False
+        oldest_out = min(p.stat().st_mtime for p in outs)
+        return _newest_mtime(self.inputs()) <= oldest_out
+
+
+def _newest_mtime(paths: Sequence[Path]) -> float:
+    """Newest mtime among these files and the PNGs under these directories,
+    or 0.0 when none exist."""
+    newest = 0.0
+    for path in paths:
+        if path.is_file():
+            newest = max(newest, path.stat().st_mtime)
+        elif path.is_dir():
+            for child in path.rglob("*.png"):
+                try:
+                    newest = max(newest, child.stat().st_mtime)
+                except OSError:
+                    continue
+    return newest
+
+
+def _stitch_stage(label: str, src_dir: Path, out_rel: str, *,
+                  channels: int, read_flag: int) -> Callable[[Ctx], None]:
+    """Stage body for a plain "stitch a tile folder, write it" output."""
+
+    def _run(ctx: Ctx) -> None:
+        canvas = ctx._stitch_dir(label, src_dir, channels=channels,
+                                 read_flag=read_flag)
+        if canvas is None:
+            return
+        out_path = _final(out_rel)
+        _write_with_alpha(canvas, ctx.world_alpha, out_path)
+        LOG.saved(out_path)
+
+    return _run
+
+
+def _run_ao(ctx: Ctx) -> None:
+    if ctx.ao is None:
+        return
+    out_path = _final(f"{TECHNICAL_DIR}/ao.png")
+    _write_with_alpha(ctx.ao, ctx.world_alpha, out_path)
+    LOG.saved(out_path)
+
+
+def _run_group(src_root: Path, layers: Sequence[str],
+               out_dir: str) -> Callable[[Ctx], None]:
+    """Stage body for a folder of sibling layers."""
+
+    def _run(ctx: Ctx) -> None:
+        if not src_root.is_dir():
+            print(f"[WARN] {src_root} not found; skipping {out_dir}")
+            return
+        for layer in layers:
+            canvas = ctx._stitch_dir(f"{out_dir}/{layer}", src_root / layer,
+                                     channels=4,
+                                     read_flag=cv2.IMREAD_UNCHANGED)
+            if canvas is None:
+                continue
+            out_path = _final(f"{out_dir}/{layer}.png")
+            _write_with_alpha(canvas, ctx.world_alpha, out_path)
+            LOG.saved(out_path)
+
+    return _run
+
+
+def _run_id(ctx: Ctx) -> None:
+    if not ctx.id_coverage:
+        print(f"[WARN] no ID coverage to write")
+        return
+    for cat, canvas in ctx.id_coverage.items():
+        out_path = _final(f"id/{cat}.png")
+        _write_with_alpha(canvas, ctx.world_alpha, out_path)
+        LOG.saved(out_path)
+
+
+def _run_fly_alert(ctx: Ctx) -> None:
+    if ctx.raw_landscape is None:
+        print("  [WARN] no landscape heightmap; skipping fly_alert")
+        return
+    build_fly_alert(ctx.raw_landscape, ctx.height, ctx.width,
+                    ctx.id_coverage.get("rocks"),
+                    _final(f"{ASSEMBLY_DIR}/fly_alert.png"))
+
+
+def _run_contour(ctx: Ctx) -> None:
+    if ctx.contour_rgba is None:
+        print("  [WARN] no landscape heightmap; skipping contour")
+        return
+    out_path = _final(f"{TECHNICAL_DIR}/contour.png")
+    _write_rgba(ctx.contour_rgba, out_path)
+    LOG.saved(out_path)
+
+
+def _run_contours(ctx: Ctx) -> None:
+    if ctx.contour_rgba is None:
+        print("  [WARN] no landscape heightmap; skipping contours")
+        return
+    build_contours_assembly(ctx.contour_rgba, ctx.ground01, ctx.water01,
+                            _final(f"{ASSEMBLY_DIR}/contours.png"))
+
+
+def _run_heightmap_simple(ctx: Ctx) -> None:
+    if ctx.raw_water is None:
+        return
+    build_heightmap_simple(ctx.raw_water, ctx.world_alpha,
+                           _final(f"{TECHNICAL_DIR}/heightmap_simple.png"))
+
+
+def _run_dive_alert(ctx: Ctx) -> None:
+    water_cov = ctx.id_coverage.get("water")
+    if ctx.raw_landscape is None or ctx.raw_water is None or water_cov is None:
+        print("  [WARN] missing heightmap/water coverage; skipping dive_alert")
+        return
+    build_dive_alert(ctx.raw_landscape, ctx.raw_water, water_cov,
+                     ctx.world_alpha,
+                     _final(f"{ASSEMBLY_DIR}/dive_alert.png"))
+
+
+def _run_base_layer(ctx: Ctx) -> None:
+    print("=== assembling base_layer inputs ===")
+    terrain_recolor = (
+        build_terrain_recolor(ctx.id_coverage, ctx.world_alpha,
+                              ctx.height, ctx.width)
+        if ctx.id_coverage else None
+    )
+    water_recolor = build_water_recolor(ctx.id_coverage.get("water"),
+                                        ctx.world_alpha,
+                                        ctx.height, ctx.width)
+    highs, lows = ctx.highs_lows
+    build_base_layer(terrain_recolor, ctx.shades, highs, lows, water_recolor,
+                     ctx.ao, ctx.ground01, ctx.world_alpha,
+                     _final(f"{ASSEMBLY_DIR}/base_layer.png"))
+
+
+def _run_rdz(ctx: Ctx) -> None:
+    build_rdz(ctx.height, ctx.width, _final(f"{ASSEMBLY_DIR}/rdz.png"))
+
+
+def _run_ranges(ctx: Ctx) -> None:
+    build_ranges(ctx.height, ctx.width, ctx.ground01, ctx.water01,
+                 _final(f"{ASSEMBLY_DIR}/ranges.png"))
+
+
+def _id_outputs() -> List[Path]:
+    if not ID_DIR.is_dir():
+        return []
+    return [_final(f"id/{d.name}.png")
+            for d in sorted(ID_DIR.iterdir()) if d.is_dir()]
+
+
+def _group_outputs(src_root: Path, layers: Sequence[str],
+                   out_dir: str) -> List[Path]:
+    return [_final(f"{out_dir}/{layer}.png") for layer in layers
+            if (src_root / layer).is_dir()]
+
+
+# Declaration order is run order: rdz and ranges read the stitched
+# svg_layers world PNGs, so those must come first.
+STAGES: List[Stage] = [
+    Stage("ao", "technical/ao.png", _run_ao,
+          lambda: [_final(f"{TECHNICAL_DIR}/ao.png")], lambda: [AO_DIR],
+          needs=("world_alpha", "ao")),
+    Stage("roads", "assembly/roads.png",
+          _stitch_stage("roads", ROADS_DIR, f"{ASSEMBLY_DIR}/roads.png",
+                        channels=4, read_flag=cv2.IMREAD_UNCHANGED),
+          lambda: [_final(f"{ASSEMBLY_DIR}/roads.png")], lambda: [ROADS_DIR],
+          needs=("world_alpha",)),
+    Stage("beaches", "assembly/beaches.png",
+          _stitch_stage("beaches", BEACHES_DIR, f"{ASSEMBLY_DIR}/beaches.png",
+                        channels=4, read_flag=cv2.IMREAD_UNCHANGED),
+          lambda: [_final(f"{ASSEMBLY_DIR}/beaches.png")],
+          lambda: [BEACHES_DIR],
+          needs=("world_alpha",)),
+    Stage("bridges_aim", "assembly/bridges_aim.png",
+          _stitch_stage("bridges_aim", BRIDGES_AIM_DIR,
+                        f"{ASSEMBLY_DIR}/bridges_aim.png",
+                        channels=4, read_flag=cv2.IMREAD_UNCHANGED),
+          lambda: [_final(f"{ASSEMBLY_DIR}/bridges_aim.png")],
+          lambda: [BRIDGES_AIM_DIR],
+          needs=("world_alpha",)),
+    Stage("split_layers", f"split_layers/<layer>.png ({len(SPLIT_LAYERS)})",
+          _run_group(SPLIT_LAYERS_DIR, list(SPLIT_LAYERS), "split_layers"),
+          lambda: _group_outputs(SPLIT_LAYERS_DIR, list(SPLIT_LAYERS),
+                                 "split_layers"),
+          lambda: [SPLIT_LAYERS_DIR],
+          needs=("world_alpha",)),
+    Stage("svg_layers", f"svg_layers/<layer>.png ({len(SVG_LAYERS)})",
+          _run_group(SVG_LAYERS_DIR, list(SVG_LAYERS), "svg_layers"),
+          lambda: _group_outputs(SVG_LAYERS_DIR, list(SVG_LAYERS),
+                                 "svg_layers"),
+          lambda: [SVG_LAYERS_DIR],
+          needs=("world_alpha",)),
+    Stage("id", "id/<category>.png", _run_id,
+          _id_outputs, lambda: [ID_DIR],
+          needs=("world_alpha", "id_coverage")),
+    Stage("fly_alert", "assembly/fly_alert.png", _run_fly_alert,
+          lambda: [_final(f"{ASSEMBLY_DIR}/fly_alert.png")],
+          lambda: [HM_LANDSCAPE_DIR, ID_DIR / "rocks",
+                   FLY_ALERT_PATTERN_FILE],
+          needs=("raw_landscape", "id_coverage")),
+    Stage("contour", "technical/contour.png", _run_contour,
+          lambda: [_final(f"{TECHNICAL_DIR}/contour.png")],
+          lambda: [HM_LANDSCAPE_DIR, ID_DIR / "terrain"],
+          needs=("raw_landscape", "id_coverage", "contour_rgba")),
+    Stage("heightmap_simple", "technical/heightmap_simple.png",
+          _run_heightmap_simple,
+          lambda: [_final(f"{TECHNICAL_DIR}/heightmap_simple.png")],
+          lambda: [HM_WATER_DIR],
+          needs=("raw_water", "world_alpha")),
+    Stage("dive_alert", "assembly/dive_alert.png", _run_dive_alert,
+          lambda: [_final(f"{ASSEMBLY_DIR}/dive_alert.png")],
+          lambda: [HM_LANDSCAPE_DIR, HM_WATER_DIR, ID_DIR / "water"],
+          needs=("raw_landscape", "raw_water", "id_coverage",
+                 "world_alpha")),
+    Stage("base_layer", "assembly/base_layer.png", _run_base_layer,
+          lambda: [_final(f"{ASSEMBLY_DIR}/base_layer.png")],
+          lambda: [AO_DIR, ID_DIR, LAYERS_DIR, HM_LANDSCAPE_DIR],
+          needs=("world_alpha", "ao", "id_coverage", "shades",
+                 "ground_u8", "ground01", "raw_landscape", "highs_lows")),
+    Stage("contours", "assembly/contours.png", _run_contours,
+          lambda: [_final(f"{ASSEMBLY_DIR}/contours.png")],
+          lambda: [HM_LANDSCAPE_DIR, ID_DIR],
+          needs=("raw_landscape", "contour_rgba", "id_coverage",
+                 "ground_u8", "ground01", "water01", "world_alpha")),
+    Stage("rdz", "assembly/rdz.png", _run_rdz,
+          lambda: [_final(f"{ASSEMBLY_DIR}/rdz.png")],
+          lambda: [RDZ_PATTERN_FILE, _final("svg_layers/rdz_grace.png")],
+          needs=(), requires=("svg_layers",)),
+    Stage("ranges", "assembly/ranges.png", _run_ranges,
+          lambda: [_final(f"{ASSEMBLY_DIR}/ranges.png")],
+          lambda: [ID_DIR] + [_final(f"svg_layers/{n}.png") for n in
+                              ("ranges_tap", "ranges_intel", "ranges_ai",
+                               "ranges_mh", "ranges_cg", "ranges_aag")],
+          needs=("id_coverage", "ground_u8", "ground01", "water01",
+                 "world_alpha"),
+          requires=("svg_layers",)),
+]
+
+
+def with_prerequisites(
+    selected: Sequence[Stage],
+) -> Tuple[List[Stage], List[Tuple[str, str]]]:
+    """Add any stage whose output a selected stage reads off disk, unless
+    it is already up to date. Returns the expanded list in declaration
+    order plus (added, because-of) pairs, so the run can say why it grew."""
+    by_name = {s.name: s for s in STAGES}
+    chosen = {s.name for s in selected}
+    pulled: List[Tuple[str, str]] = []
+    queue = list(selected)
+    while queue:
+        stage = queue.pop()
+        for req_name in stage.requires:
+            req = by_name.get(req_name)
+            if req is None or req.name in chosen or req.up_to_date():
+                continue
+            chosen.add(req.name)
+            pulled.append((req.name, stage.name))
+            queue.append(req)
+    return [s for s in STAGES if s.name in chosen], pulled
+
+
+def pick_stages_interactive() -> Optional[List[Stage]]:
+    return tui.select_many(
+        STAGES, "Outputs to build",
+        label_fn=lambda s: f"{s.name:<17}->  {s.describe}",
+        short_fn=lambda s: s.name,
+        noun="output",
+    )
+
+
+# ------------------------------------------------------------------------------
 #  Main
 # ------------------------------------------------------------------------------
 
 def main() -> int:
-    t0 = time.time()
+    parser = argparse.ArgumentParser(
+        description="Stitch step-4 bakes into world PNGs and assemble "
+                    "final composites.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="stages: " + ", ".join(s.name for s in STAGES),
+    )
+    parser.add_argument("stages", nargs="*",
+                        help="Stage names to build; omit for interactive")
+    parser.add_argument("-a", "--all", action="store_true",
+                        help="Build every stage")
+    parser.add_argument("-f", "--force", action="store_true",
+                        help="Rebuild even when outputs are newer than "
+                             "their inputs")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print every log line instead of just progress "
+                             "and warnings")
+    args = parser.parse_args()
+
+    by_name = {s.name: s for s in STAGES}
+    if args.all:
+        selected = list(STAGES)
+    elif args.stages:
+        unknown = [n for n in args.stages if n not in by_name]
+        if unknown:
+            print(f"ERROR: unknown stage(s): {', '.join(unknown)}")
+            print(f"       known: {', '.join(by_name)}")
+            return 1
+        chosen = {n for n in args.stages}
+        selected = [s for s in STAGES if s.name in chosen]
+    else:
+        picked = pick_stages_interactive()
+        if picked is None:
+            return 1
+        # Declaration order, whatever order they were ticked in.
+        chosen = {s.name for s in picked}
+        selected = [s for s in STAGES if s.name in chosen]
+
+    selected, pulled = with_prerequisites(selected)
+    for added, because in pulled:
+        print(f"    + {added} (its output is what {because} reads, "
+              f"and it is missing or stale)")
 
     try:
         centres = load_centres()
@@ -815,231 +1300,71 @@ def main() -> int:
         return 1
 
     height, width = canvas_size(centres)
-    print(f"=== Finalizing exports ({width}x{height} px, {len(centres)} regions) ===")
+    print(f"=== Finalizing {len(selected)} output(s) "
+          f"({width}x{height} px, {len(centres)} regions) ===")
 
     FINAL_DIR.mkdir(parents=True, exist_ok=True)
+    ctx = Ctx(centres, mask, height, width)
+    # Stages are run under capture_output(), which aims fd 1 at a pipe, so
+    # the bars need their own handle on the terminal.
+    console = progress.console_stream()
 
-    # Best-effort pre-count for "[i/N]" prefixes.
-    est = 0
-    if AO_DIR.is_dir():            est += 1  # technical/ao
-    if ROADS_DIR.is_dir():         est += 1  # assembly/roads
-    if BEACHES_DIR.is_dir():       est += 1  # assembly/beaches
-    if BRIDGES_AIM_DIR.is_dir():   est += 1  # assembly/bridges_aim
-    if SPLIT_LAYERS_DIR.is_dir():
-        for _layer in SPLIT_LAYERS:
-            if (SPLIT_LAYERS_DIR / _layer).is_dir(): est += 1
-    if SVG_LAYERS_DIR.is_dir():
-        for _layer in SVG_LAYERS:
-            if (SVG_LAYERS_DIR / _layer).is_dir(): est += 1
-    if ID_DIR.is_dir():
-        est += sum(1 for d in ID_DIR.iterdir() if d.is_dir())
-    if HM_LANDSCAPE_DIR.is_dir():  est += 3  # fly_alert, contour, contours
-    if HM_WATER_DIR.is_dir():      est += 1  # heightmap_simple
-    if HM_LANDSCAPE_DIR.is_dir() and HM_WATER_DIR.is_dir():
-        est += 1  # dive_alert
-    est += 3  # base_layer, rdz, ranges (may skip)
-    LOG.set_total(est)
+    t0 = time.time()
+    failed: List[str] = []
+    skipped = 0
+    tracker = progress.Tracker()
 
-    world_alpha = _compute_world_alpha(centres, mask, height, width)
+    def _free_after(pos: int) -> None:
+        """Drop cached canvases no later stage needs."""
+        ctx.release_except({n for later in selected[pos + 1:]
+                            for n in later.needs})
 
-    def _stitch_then_alpha(
-        label: str,
-        src_dir: Path,
-        *,
-        channels: int,
-        read_flag: int,
-        out_rel: str,
-    ) -> np.ndarray | None:
-        if not src_dir.is_dir():
-            LOG.info(f"[skip] {label}: source dir not found ({src_dir.name})")
-            return None
-        print(f"\n=== stitching {label} ===")
-        tile_map = _build_tile_map(src_dir)
-        canvas = stitch(tile_map, centres, mask, height, width,
-                        channels=channels, dtype=np.uint8,
-                        read_flag=read_flag)
-        out_path = FINAL_DIR / out_rel
-        _write_with_alpha(canvas, world_alpha, out_path)
-        LOG.saved(out_path)
-        return canvas
-
-    # -- technical/ao (also reused for base_layer multiply) --
-    ao_canvas = _stitch_then_alpha(
-        "ao", AO_DIR, channels=1, read_flag=cv2.IMREAD_GRAYSCALE,
-        out_rel=f"{TECHNICAL_DIR}/ao.png",
-    )
-
-    # -- assembly/roads & assembly/beaches --
-    _stitch_then_alpha(
-        "roads", ROADS_DIR,
-        channels=4, read_flag=cv2.IMREAD_UNCHANGED,
-        out_rel=f"{ASSEMBLY_DIR}/roads.png",
-    )
-    _stitch_then_alpha(
-        "beaches", BEACHES_DIR,
-        channels=4, read_flag=cv2.IMREAD_UNCHANGED,
-        out_rel=f"{ASSEMBLY_DIR}/beaches.png",
-    )
-
-    # -- assembly/bridges_aim (procedural per-region tiles, own folder) --
-    if BRIDGES_AIM_DIR.is_dir():
-        _stitch_then_alpha(
-            "bridges_aim", BRIDGES_AIM_DIR,
-            channels=4, read_flag=cv2.IMREAD_UNCHANGED,
-            out_rel=f"{ASSEMBLY_DIR}/bridges_aim.png",
-        )
-    else:
-        print(f"\n[WARN] {BRIDGES_AIM_DIR} not found; "
-              f"skipping bridges_aim stitching")
-
-    # -- split_layers/<layer>.png (unchanged location) --
-    if SPLIT_LAYERS_DIR.is_dir():
-        for layer in SPLIT_LAYERS:
-            src = SPLIT_LAYERS_DIR / layer
-            _stitch_then_alpha(
-                f"split_layers/{layer}", src,
-                channels=4, read_flag=cv2.IMREAD_UNCHANGED,
-                out_rel=f"split_layers/{layer}.png",
-            )
-    else:
-        print(f"\n[WARN] {SPLIT_LAYERS_DIR} not found; "
-              f"skipping split_layer stitching")
-
-    # -- svg_layers/<layer>.png (unchanged location; consumed below) --
-    if SVG_LAYERS_DIR.is_dir():
-        for layer in SVG_LAYERS:
-            src = SVG_LAYERS_DIR / layer
-            _stitch_then_alpha(
-                f"svg_layers/{layer}", src,
-                channels=4, read_flag=cv2.IMREAD_UNCHANGED,
-                out_rel=f"svg_layers/{layer}.png",
-            )
-    else:
-        print(f"\n[WARN] {SVG_LAYERS_DIR} not found; "
-              f"skipping svg_layer stitching")
-
-    # -- id/<cat>.png (unchanged location) --
-    id_coverage: Dict[str, np.ndarray] = {}
-    if not ID_DIR.is_dir():
-        print(f"\n[WARN] {ID_DIR} not found; per-category ID coverage skipped")
-    else:
-        cat_dirs = sorted(d for d in ID_DIR.iterdir() if d.is_dir())
-        for cat_dir in cat_dirs:
-            cat = cat_dir.name
-            print(f"\n=== stitching id/{cat} ===")
-            tile_map = _build_tile_map(cat_dir)
-            if not tile_map:
-                print(f"  [skip] no tiles in {cat_dir}")
+    with tui.Progress("Finalizing", unit="stage", step_unit="stage",
+                      stream=console) as disp:
+        disp.start("stages", "outputs", len(selected))
+        for pos, stage in enumerate(selected):
+            if not args.force and stage.up_to_date():
+                disp.log(f"{tui.dim(tui.glyph(chr(0xB7), '-'))} "
+                         f"{stage.name}  {tui.dim('up to date')}")
+                disp.update("stages", advance=1, status=stage.name)
+                skipped += 1
+                _free_after(pos)
                 continue
-            canvas = stitch(
-                tile_map, centres, mask, height, width,
-                channels=1, dtype=np.uint8,
-                read_flag=cv2.IMREAD_GRAYSCALE,
-            )
-            id_coverage[cat] = canvas
-            out_path = FINAL_DIR / "id" / f"{cat}.png"
-            _write_with_alpha(canvas, world_alpha, out_path)
-            LOG.saved(out_path)
+            disp.update("stages", status=stage.name)
+            started = time.time()
+            reason = trace = ""
+            with progress.capture_output(disp, "stages", tracker,
+                                         stage.name, args.verbose):
+                try:
+                    stage.run(ctx)
+                except Exception as exc:
+                    reason = f"{type(exc).__name__}: {exc}"
+                    trace = traceback.format_exc().rstrip()
+                    failed.append(stage.name)
+            if not reason:
+                disp.log(f"{tui.green(tui.glyph(chr(0x2713), '+'))} "
+                         f"{stage.name}  "
+                         f"{tui.dim(f'{time.time() - started:.1f}s')}")
+            else:
+                disp.log(tui.red(f"{tui.glyph(chr(0x2717), 'x')} "
+                                 f"{stage.name}: {reason}"))
+                disp.log(tui.dim(trace))
+            disp.update("stages", advance=1)
+            _free_after(pos)
+        disp.finish("stages", not failed,
+                    note=f"{len(failed)} failed")
 
-    terrain_cov = id_coverage.get("terrain")
-    water_cov = id_coverage.get("water")
-    rocks_cov = id_coverage.get("rocks")
+    if console is not sys.stdout:
+        console.close()
 
-    world_terrain = (terrain_cov > 0) if terrain_cov is not None else None
-
-    # -- ground mask = terrain * (not water), 0..1 float --
-    if terrain_cov is not None:
-        if water_cov is not None:
-            non_water = (255 - water_cov).astype(np.uint16)
-            ground_u8 = (
-                (terrain_cov.astype(np.uint16) * non_water + 127) // 255
-            ).astype(np.uint8)
-        else:
-            ground_u8 = terrain_cov.copy()
-        ground_u8 = np.minimum(ground_u8, world_alpha)
-    else:
-        ground_u8 = np.zeros((height, width), dtype=np.uint8)
-    ground01 = ground_u8.astype(np.float32) / 255.0
-    water01 = (water_cov.astype(np.float32) / 255.0
-               if water_cov is not None
-               else np.zeros((height, width), dtype=np.float32))
-
-    # -- heightmap products --
-    raw_landscape = stitch_heightmap_landscape(centres, mask, height, width)
-    highs = lows = None
-    contour_rgba = None
-    if raw_landscape is not None:
-        print(f"\n=== deriving heightmap_landscape products ===")
-        highs, lows = compute_highs_lows(raw_landscape)
-        build_fly_alert(
-            raw_landscape, height, width, rocks_cov,
-            FINAL_DIR / ASSEMBLY_DIR / "fly_alert.png",
-        )
-        contour_rgba = build_contour(
-            raw_landscape, world_terrain, height, width,
-        )
-        contour_out = FINAL_DIR / TECHNICAL_DIR / "contour.png"
-        _write_rgba(contour_rgba, contour_out)
-        LOG.saved(contour_out)
-
-    raw_water = stitch_heightmap_water(centres, mask, height, width)
-    if raw_water is not None:
-        print(f"\n=== deriving heightmap_water products ===")
-        build_heightmap_simple(
-            raw_water, world_alpha,
-            FINAL_DIR / TECHNICAL_DIR / "heightmap_simple.png",
-        )
-
-    if (
-        raw_landscape is not None
-        and raw_water is not None
-        and water_cov is not None
-    ):
-        build_dive_alert(
-            raw_landscape, raw_water, water_cov, world_alpha,
-            FINAL_DIR / ASSEMBLY_DIR / "dive_alert.png",
-        )
-    else:
-        print("  [WARN] missing heightmap/water coverage; skipping dive_alert")
-
-    del raw_landscape, raw_water
-
-    # -- in-memory intermediates for base_layer --
-    print(f"\n=== assembling base_layer inputs ===")
-    terrain_recolor = (
-        build_terrain_recolor(id_coverage, world_alpha, height, width)
-        if id_coverage else None
-    )
-    water_recolor = build_water_recolor(water_cov, world_alpha, height, width)
-
-    # shade_alpha = terrain * (not water) ∧ world_alpha (same as ground_u8)
-    shade_alpha = ground_u8 if terrain_cov is not None else None
-    shades_pair = build_shades(centres, mask, height, width, shade_alpha)
-
-    # -- assembly/base_layer.png --
-    build_base_layer(
-        terrain_recolor, shades_pair, highs, lows, water_recolor, ao_canvas,
-        ground01, world_alpha,
-        FINAL_DIR / ASSEMBLY_DIR / "base_layer.png",
-    )
-
-    # -- assembly/contours.png (blurred contour with alpha gating) --
-    if contour_rgba is not None:
-        build_contours_assembly(
-            contour_rgba, ground01, water01,
-            FINAL_DIR / ASSEMBLY_DIR / "contours.png",
-        )
-
-    # -- assembly/rdz.png --
-    build_rdz(height, width, FINAL_DIR / ASSEMBLY_DIR / "rdz.png")
-
-    # -- assembly/ranges.png --
-    build_ranges(
-        height, width, ground01, water01,
-        FINAL_DIR / ASSEMBLY_DIR / "ranges.png",
-    )
-
-    print(f"\n=== SUCCESS (in {time.time() - t0:.2f}s) ===")
+    took = time.time() - t0
+    if skipped:
+        print(f"    {skipped} stage(s) already up to date "
+              f"(use -f to rebuild)")
+    if failed:
+        print(f"\n{len(failed)} stage(s) failed: {', '.join(failed)}")
+        return 1
+    print(f"\n=== SUCCESS (in {took:.2f}s) ===")
     return 0
 
 

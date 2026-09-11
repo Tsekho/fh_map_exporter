@@ -83,7 +83,30 @@ EXPORTER_PUBLISH_DIR = (
 # 2_blend_all.py, 3_blend_spills.py, and 4_render_spills.py.
 # Set to 1 to force serial execution in the parent process (no subprocesses).
 NUM_WORKERS = 6
-NUM_WORKERS_SPILLS = 3
+
+# 4_render_spills.py is capped by RAM, not cores: ~4.9 GB peak per worker.
+# Overshooting pages and is slower than running fewer workers.
+NUM_WORKERS_SPILLS = 5
+
+# The -svg pass never opens a .blend, so it isn't bound by that ceiling.
+NUM_WORKERS_SVG = 12
+
+# Row-pool threads inside each render worker. 0 = cores // NUM_WORKERS_SPILLS.
+BAKE_ROW_THREADS = 0
+
+# Reuse one BVH across the bakes that share an object set (heightmap+ID,
+# heightmap_water+water coverage). A reused tree keeps the first caller's
+# triangle order, so rays landing on coincident faces can tie-break
+# differently; set False if ID output must be bit-identical.
+BVH_CACHE_REUSE = True
+
+# Queue Cycles renders through a machine-wide lock so workers take the GPU
+# in turn instead of thrashing it (utils/gpu_lock.py).
+GPU_SERIALIZE_RENDERS = True
+
+# Let Cycles use the CPU alongside the GPU. A net loss with several workers
+# in flight: those CPU devices compete with every other worker's raycast bake.
+CYCLES_USE_CPU_WITH_GPU = False
 
 
 FOXHOLE_PAK = Path(
