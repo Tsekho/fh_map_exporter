@@ -190,7 +190,8 @@ class Map:
         """Placement grouped by category: <root>/<category>/<seg_1>/..."""
         flat = self._flatten()
         if announce:
-            total_inst = sum(len(v) for k, v in flat.items() if k in mesh_to_category)
+            total_inst = sum(
+                len(v) for k, v in flat.items() if k in mesh_to_category)
             placed_meshes = sum(1 for k in flat if k in mesh_to_category)
             print(f"[meshes] {placed_meshes:,} unique meshes, "
                   f"{total_inst:,} instances ...")
@@ -241,9 +242,20 @@ class Map:
         def _keep(t: list) -> bool:
             return border_filter is None or border_filter(t)
 
+        if announce:
+            s_inst = sum(len(v) for v in self.symbols.values())
+            g_inst = sum(len(v) for v in self.groups.values())
+            sp_inst = sum(len(v) for v in self.splines.values())
+            bp_inst = sum(
+                sum(len(v) for k, v in inst.items() if k != "_self")
+                for lst in self.blueprints.values()
+                for inst in lst
+            )
+            print(f"[place] {s_inst + g_inst + sp_inst + bp_inst:,} "
+                  f"mesh instances ...")
+
         if self.symbols:
             if announce:
-                s_inst = sum(len(v) for v in self.symbols.values())
                 print(f"[symbols] {len(self.symbols):,} unique meshes, "
                       f"{s_inst:,} instances ...")
             s_root = bpy.data.collections.new("Symbols")
@@ -261,7 +273,6 @@ class Map:
 
         if self.groups:
             if announce:
-                g_inst = sum(len(v) for v in self.groups.values())
                 print(f"[groups]  {len(self.groups):,} unique meshes, "
                       f"{g_inst:,} instances ...")
             g_root = bpy.data.collections.new("Groups")
@@ -279,7 +290,6 @@ class Map:
 
         if self.splines:
             if announce:
-                sp_inst = sum(len(v) for v in self.splines.values())
                 print(f"[splines] {len(self.splines):,} unique meshes, "
                       f"{sp_inst:,} instances ...")
             sp_root = bpy.data.collections.new("Splines")
@@ -299,11 +309,6 @@ class Map:
 
         if self.blueprints:
             if announce:
-                bp_inst = sum(
-                    sum(len(v) for k, v in inst.items() if k != "_self")
-                    for lst in self.blueprints.values()
-                    for inst in lst
-                )
                 print(f"[blueprints] {len(self.blueprints):,} classes, "
                       f"{bp_inst:,} mesh instances ...")
             b_root = bpy.data.collections.new("Blueprints")

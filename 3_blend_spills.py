@@ -17,6 +17,7 @@ from utils.config import (
     CATEGORY_COLORS, CENTRES_FILE, EXPORT_DIR, JSON_DIR, NUM_WORKERS,
     CATALOGUE_FILE,
 )
+from utils import progress, tui
 from utils.regions import build_region_with_spill
 from utils.parallel import run_parallel_subprocesses
 
@@ -25,6 +26,20 @@ def load_json_name_map() -> Dict[str, str]:
     if not JSON_DIR.is_dir():
         return {}
     return {p.stem.lower(): p.stem for p in JSON_DIR.glob("*.json")}
+
+
+# Checkpoints build_region_with_spill() prints, in order. One line, one
+# checkpoint; the neighbor line comes once per hexagonal neighbor.
+SPILL_PHASES = [
+    (r"^\[terrain\]", "focus terrain"),
+    (r"^\[meshes\]", "focus objects"),
+    (r"^\[neighbor\]", "neighbor spill", 6),
+    # Not map.py's parse-time "[splines] N unique meshes": every neighbor
+    # Map() prints one, and it would skip the bar to the end.
+    (r"^\[splines\] placed", "splines"),
+    (r"^Saving ->", "saving"),
+    (r"^Done\.", "saved"),
+]
 
 
 def pick_region_interactive(
@@ -36,26 +51,11 @@ def pick_region_interactive(
         print(f"ERROR: no regions available (check {JSON_DIR} and {CENTRES_FILE})")
         return None
 
-    names = [json_name_map[k] for k in keys]
-
-    print("Available regions:")
-    print("    0. All regions")
-    for i, name in enumerate(names, 1):
-        print(f"  {i:3}. {name}")
-
-    while True:
-        raw = input("\nSelect region (0 for all, number or name): ").strip()
-        if raw == "0":
-            return keys
-        if raw.isdigit():
-            idx = int(raw) - 1
-            if 0 <= idx < len(keys):
-                return [keys[idx]]
-        elif raw in names:
-            return [keys[names.index(raw)]]
-        elif raw.lower() in region_centers and raw.lower() in json_name_map:
-            return [raw.lower()]
-        print("  Invalid selection, try again.")
+    return tui.select_many(
+        keys, "Regions to build",
+        label_fn=lambda k: json_name_map[k],
+        noun="region",
+    )
 
 
 def main() -> int:
@@ -67,6 +67,9 @@ def main() -> int:
                         help="Region name; omit for interactive selection")
     parser.add_argument("-a", "--all", action="store_true",
                         help="Process every region in export/_json")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print every build log line instead of just "
+                             "progress bars and warnings")
     args = parser.parse_args()
 
     if not CENTRES_FILE.is_file():
@@ -119,6 +122,8 @@ def main() -> int:
     print(f"=== Building {len(region_keys)} region spill(s) "
           f"(workers={NUM_WORKERS if parallel else 1}) ===")
 
+    tracker = progress.PhaseTracker(SPILL_PHASES)
+
     if parallel:
         def _cmd(key: str) -> List[str]:
             name = json_name_map.get(key, key)
@@ -128,6 +133,10 @@ def main() -> int:
             region_keys, _cmd,
             workers=NUM_WORKERS,
             label_fn=lambda k: json_name_map.get(k, k),
+            tracker=tracker,
+            title="Building spills",
+            unit="region",
+            verbose=args.verbose,
         )
         if failed:
             names = [json_name_map.get(k, k) for k in failed]
@@ -136,25 +145,27 @@ def main() -> int:
         print(f"\n=== SUCCESS ===")
         return 0
 
-    errors: List[str] = []
-    total = len(region_keys)
-    w = len(str(total))
-    for i, key in enumerate(region_keys, 1):
-        name = json_name_map.get(key, key)
-        print(f"\n=== [{i:>{w}}/{total}] {name} ===")
-        try:
-            build_region_with_spill(
-                region_key=key,
-                export_dir=str(EXPORT_DIR),
-                region_centers=region_centers,
-                catalogue=catalogue,
-                json_name_map=json_name_map,
-            )
-        except Exception as exc:
-            print(f"ERROR while processing {name}: {exc}")
-            errors.append(name)
+    def _build(key: str) -> bool:
+        build_region_with_spill(
+            region_key=key,
+            export_dir=str(EXPORT_DIR),
+            region_centers=region_centers,
+            catalogue=catalogue,
+            json_name_map=json_name_map,
+        )
+        return True
 
-    if errors:
+    failed_keys = progress.run_serial(
+        region_keys, _build,
+        title="Building spills",
+        tracker=tracker,
+        label_fn=lambda k: json_name_map.get(k, k),
+        unit="region",
+        verbose=args.verbose,
+    )
+
+    if failed_keys:
+        errors = [json_name_map.get(k, k) for k in failed_keys]
         print(f"\n{len(errors)} region(s) failed: {', '.join(errors)}")
         return 1
 

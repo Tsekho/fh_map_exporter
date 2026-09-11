@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from utils import tui
 from utils.config import CENTRES_FILE, JSON_DIR, MASK_FILE, TILE_SIZE
 
 
@@ -65,47 +66,38 @@ def _list_pngs(cwd: Path) -> List[Path]:
     return sorted(p for p in cwd.glob("*.png") if p.is_file())
 
 
+_PASTE = "Paste a path manually..."
+
+
 def _pick_source_interactive() -> Optional[Path]:
-    cwd = Path.cwd()
-    pngs = _list_pngs(cwd)
+    pngs = _list_pngs(Path.cwd())
 
-    print("Available PNG files in current directory:")
-    if pngs:
-        for i, p in enumerate(pngs, 1):
-            print(f"  {i:3}. {p.name}")
-    else:
-        print("  (none)")
-    print("    0. Paste a path manually")
+    picked = tui.select_one(
+        pngs, "Source PNG",
+        label_fn=lambda p: p.name,
+        extra=_PASTE,
+        noun="PNG",
+    )
+    if picked is None:
+        return None
+    if picked != _PASTE:
+        return picked
 
     while True:
-        raw = input("\nSelect PNG (number or 0 to paste): ").strip()
-        if raw == "0" or (not raw and not pngs):
-            path_raw = input("Path to PNG: ").strip().strip('"').strip("'")
-            if not path_raw:
-                print("  empty path; try again")
-                continue
-            p = Path(path_raw).expanduser()
-            if not p.is_file():
-                print(f"  not a file: {p}")
-                continue
-            return p
-        if raw.isdigit():
-            idx = int(raw) - 1
-            if 0 <= idx < len(pngs):
-                return pngs[idx]
-        print("  invalid selection; try again")
+        path_raw = input("Path to PNG: ").strip().strip('"').strip("'")
+        if not path_raw:
+            print("  empty path; try again")
+            continue
+        p = Path(path_raw).expanduser()
+        if not p.is_file():
+            print(f"  not a file: {p}")
+            continue
+        return p
 
 
-def _ask_1k() -> bool:
-    while True:
-        raw = input(
-            "\nDownscale output to 1k (1024x888)? [y/N]: "
-        ).strip().lower()
-        if raw in ("", "n", "no"):
-            return False
-        if raw in ("y", "yes"):
-            return True
-        print("  please answer y or n")
+def _ask_1k() -> Optional[bool]:
+    """None when the user cancels."""
+    return tui.confirm("Downscale output to 1k (1024x888)?", default=False)
 
 
 def _load_source(path: Path) -> np.ndarray:
@@ -191,6 +183,8 @@ def main() -> int:
     if src_path is None:
         return 1
     one_k = _ask_1k()
+    if one_k is None:
+        return 1
 
     try:
         src = _load_source(src_path)
@@ -209,15 +203,17 @@ def main() -> int:
     )
     print(f"    output: {out_dir}")
 
-    for i, (name, (cx, cy)) in enumerate(centres.items(), 1):
-        tile = _extract_tile(src, cx, cy)
-        tile = _apply_mask(tile, mask)
-        tile = _finalize(tile, one_k)
-        out_path = out_dir / f"{name}.png"
-        cv2.imwrite(str(out_path), tile)
-        print(f"  [{i:>{len(str(total))}}/{total}] {out_path.name}")
+    with tui.Progress("Breaking tiles", unit="tile", step_unit="tile") as bar:
+        bar.start("tiles", src_path.stem, total)
+        for name, (cx, cy) in centres.items():
+            tile = _extract_tile(src, cx, cy)
+            tile = _apply_mask(tile, mask)
+            tile = _finalize(tile, one_k)
+            cv2.imwrite(str(out_dir / f"{name}.png"), tile)
+            bar.update("tiles", advance=1, status=name)
+        bar.finish("tiles")
 
-    print("\n=== SUCCESS ===")
+    print("=== SUCCESS ===")
     return 0
 
 

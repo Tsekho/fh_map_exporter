@@ -17,12 +17,17 @@ from utils.config import (
     AO_SLOPE_POWER_STRONG,
     AO_SLOPE_POWER_WEAK,
     AO_SLOPE_POWER_SL,
+    BAKE_ROW_THREADS,
+    BVH_CACHE_REUSE,
+    CYCLES_USE_CPU_WITH_GPU,
     MIN_SPLIT_LAYER_VALUE,
+    NUM_WORKERS_SPILLS,
     SPLIT_LAYER_EDGE_SHADER_POWER,
     SPLIT_LAYER_EDGE_SHADER_RADIUS_PX,
     SPLIT_LAYER_EDGE_SHADER_STRENGTH,
     short_path,
 )
+from utils.gpu_lock import gpu_slot
 from utils.png import write_png16_gray, write_png8_gray, write_png8_rgb, write_png8_rgba
 
 
@@ -59,19 +64,80 @@ def _bake_pixel_world_xy(size: int = BAKE_IMG_SIZE) -> Tuple[np.ndarray, np.ndar
     return X, Y
 
 
+def _obj_index_map() -> Dict[str, int]:
+    """name -> index into bpy.data.objects (the order foreach_* uses)."""
+    return {o.name: i for i, o in enumerate(bpy.data.objects)}
+
+
 def _set_hide(objs: List[bpy.types.Object], hide: bool, key: str) -> Dict:
+    """Bulk-set a boolean object flag, returning the previous values.
+
+    Writing ``o.hide_render`` one object at a time re-tags the depsgraph
+    on every assignment: measured at ~2.6 ms per object, or 23 s for a
+    region's ~10.9k objects. foreach_get/foreach_set do the whole
+    collection in a single C call (~11000x faster), so the flips stop
+    dominating the Cycles stage.
+    """
+    all_objs = bpy.data.objects
+    n = len(all_objs)
+    if n == 0 or not objs:
+        return {}
+
+    buf = np.empty(n, dtype=bool)
+    all_objs.foreach_get(key, buf)
+    idx_of = _obj_index_map()
+
     prev: Dict[str, bool] = {}
+    idxs: List[int] = []
     for o in objs:
-        prev[o.name] = getattr(o, key)
-        setattr(o, key, hide)
+        if o is None:
+            continue
+        i = idx_of.get(o.name)
+        if i is None:
+            continue
+        prev[o.name] = bool(buf[i])
+        idxs.append(i)
+
+    if idxs:
+        buf[np.asarray(idxs, dtype=np.int64)] = bool(hide)
+        all_objs.foreach_set(key, buf)
     return prev
 
 
+def _set_hide_bulk(objs: List[bpy.types.Object], hide: bool, key: str) -> None:
+    """Like _set_hide but without recording previous values."""
+    all_objs = bpy.data.objects
+    n = len(all_objs)
+    if n == 0 or not objs:
+        return
+    buf = np.empty(n, dtype=bool)
+    all_objs.foreach_get(key, buf)
+    idx_of = _obj_index_map()
+    idxs = [idx_of[o.name] for o in objs
+            if o is not None and o.name in idx_of]
+    if idxs:
+        buf[np.asarray(idxs, dtype=np.int64)] = bool(hide)
+        all_objs.foreach_set(key, buf)
+
+
 def _restore_hide(prev: Dict[str, bool], key: str) -> None:
+    if not prev:
+        return
+    all_objs = bpy.data.objects
+    n = len(all_objs)
+    if n == 0:
+        return
+    buf = np.empty(n, dtype=bool)
+    all_objs.foreach_get(key, buf)
+    idx_of = _obj_index_map()
+    touched = False
     for name, v in prev.items():
-        o = bpy.data.objects.get(name)
-        if o is not None:
-            setattr(o, key, v)
+        i = idx_of.get(name)
+        if i is not None:
+            buf[i] = v
+            touched = True
+    if touched:
+        all_objs.foreach_set(key, buf)
 
 
 def _rasterize_targets_footprint(
@@ -179,55 +245,365 @@ def _mask_restricted_to_targets(
     return out
 
 
-def _build_bvh_from_objs(
+_EMPTY_V = np.zeros((0, 3), dtype=np.float32)
+_EMPTY_T = np.zeros((0, 3), dtype=np.int32)
+
+# Per-object LOCAL-space triangle cache, keyed by object name: a region
+# builds ~6 BVHs over heavily overlapping object sets.
+#
+# Local, not world, space is deliberate -- bake_spline_layer drops terrain
+# objects for the duration of a bake, so matrix_world is re-applied per
+# build (a cheap matmul) and object moves are picked up for free. Only
+# mesh-data edits need clear_mesh_cache().
+_TRI_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+
+def clear_mesh_cache() -> None:
+    """Drop the cached local-space triangles (call after loading a .blend
+    or after editing mesh data in place)."""
+    _TRI_CACHE.clear()
+    clear_bvh_cache()
+
+
+def _obj_local_tris(obj, depsgraph) -> Tuple[np.ndarray, np.ndarray]:
+    """(verts Nx3 float32 object-local, tris Mx3 int32) for one object.
+
+    Uses foreach_get + numpy rather than iterating ``me.vertices`` and
+    ``me.loop_triangles`` in Python, which on a region with ~21M
+    triangles built gigabytes of transient tuples.
+    """
+    cached = _TRI_CACHE.get(obj.name)
+    if cached is not None:
+        return cached
+
+    ev = obj.evaluated_get(depsgraph)
+    try:
+        me = ev.to_mesh()
+    except RuntimeError:
+        me = None
+    if me is None:
+        _TRI_CACHE[obj.name] = (_EMPTY_V, _EMPTY_T)
+        return _TRI_CACHE[obj.name]
+
+    try:
+        nv = len(me.vertices)
+        me.calc_loop_triangles()
+        nt = len(me.loop_triangles)
+        if nv == 0 or nt == 0:
+            out = (_EMPTY_V, _EMPTY_T)
+        else:
+            co = np.empty(nv * 3, dtype=np.float32)
+            me.vertices.foreach_get("co", co)
+
+            tri = np.empty(nt * 3, dtype=np.int32)
+            me.loop_triangles.foreach_get("vertices", tri)
+            out = (co.reshape(nv, 3), tri.reshape(nt, 3))
+    finally:
+        ev.to_mesh_clear()
+
+    _TRI_CACHE[obj.name] = out
+    return out
+
+
+CULL_CELL_PX = 16
+
+
+class _AreaCull:
+    """Conservative "does this XY extent touch any pixel we will cast?" test.
+
+    A bounding box is useless for the sparse layers -- roads cover 9.4% of
+    the tile but snake right across it, so their AABB is the whole region.
+    Instead the active mask is max-pooled into CULL_CELL_PX cells and an
+    integral image answers "any active cell in this rectangle?" in O(1),
+    vectorised over every triangle at once.
+
+    Conservative by construction (it tests the extent's cell rectangle, not
+    the exact shape), and rays are vertical, so nothing hittable is ever
+    dropped.
+    """
+
+    __slots__ = ("integral", "g", "cell", "size", "c", "px", "fill")
+
+    def __init__(self, mask: np.ndarray, cell_px: int = CULL_CELL_PX):
+        size = mask.shape[0]
+        cell = int(cell_px)
+        g = (size + cell - 1) // cell
+        pad = g * cell - size
+        m = mask
+        if pad:
+            m = np.pad(m, ((0, pad), (0, pad)), constant_values=False)
+        occ = m.reshape(g, cell, g, cell).any(axis=(1, 3))
+        self.integral = np.zeros((g + 1, g + 1), dtype=np.int32)
+        np.cumsum(np.cumsum(occ.astype(np.int32), axis=0), axis=1,
+                  out=self.integral[1:, 1:])
+        self.fill = float(occ.sum()) / float(occ.size) if occ.size else 1.0
+        self.g = g
+        self.cell = cell
+        self.size = size
+        self.c = size / 2.0
+        self.px = BAKE_PIXEL_SIZE_M
+
+    def _cells(self, xmin, xmax, ymin, ymax):
+        """World XY extents -> inclusive cell index ranges (clipped)."""
+        jmin = xmin / self.px + self.c - 0.5
+        jmax = xmax / self.px + self.c - 0.5
+        imin = self.c - 0.5 - ymax / self.px
+        imax = self.c - 0.5 - ymin / self.px
+        cj0 = np.clip(np.floor(jmin / self.cell), 0, self.g - 1).astype(np.int32)
+        cj1 = np.clip(np.floor(jmax / self.cell), 0, self.g - 1).astype(np.int32)
+        ci0 = np.clip(np.floor(imin / self.cell), 0, self.g - 1).astype(np.int32)
+        ci1 = np.clip(np.floor(imax / self.cell), 0, self.g - 1).astype(np.int32)
+        return ci0, ci1, cj0, cj1
+
+    def keep(self, xmin, xmax, ymin, ymax):
+        """Boolean array: True where the extent touches an active cell."""
+        ci0, ci1, cj0, cj1 = self._cells(xmin, xmax, ymin, ymax)
+        P = self.integral
+        total = (P[ci1 + 1, cj1 + 1] - P[ci0, cj1 + 1]
+                 - P[ci1 + 1, cj0] + P[ci0, cj0])
+        return total > 0
+
+    def keep_one(self, xmin, xmax, ymin, ymax) -> bool:
+        return bool(np.asarray(self.keep(
+            np.float32(xmin), np.float32(xmax),
+            np.float32(ymin), np.float32(ymax))))
+
+
+# Above this occupancy the cull cannot drop enough geometry to pay for
+# itself: a dense hex-wide mask sheds only 8% of triangles and makes the
+# build slower, while a sparse roads-shaped mask sheds 79%.
+AREA_CULL_MAX_FILL = 0.5
+
+
+def area_cull_for(mask: np.ndarray) -> Optional["_AreaCull"]:
+    """An _AreaCull for ``mask``, or None when the mask is too dense for
+    culling to be worth the bookkeeping."""
+    if mask is None or not mask.any():
+        return None
+    cull = _AreaCull(mask)
+    if cull.fill > AREA_CULL_MAX_FILL:
+        return None
+    return cull
+
+
+def _obj_overlaps_area(obj, depsgraph, cull: "_AreaCull") -> bool:
+    """World-AABB test for one object against the active bake area.
+
+    Deliberately derived from the *evaluated* local vertices (via the
+    cached extraction) rather than ``obj.bound_box``: bound_box describes
+    the un-evaluated object data, so a modifier that grows the mesh could
+    put real geometry outside it and this cull would silently drop
+    hittable triangles.
+    """
+    local, tris = _obj_local_tris(obj, depsgraph)
+    if tris.shape[0] == 0:
+        return False
+    lo = local.min(axis=0)
+    hi = local.max(axis=0)
+    corners = np.array([[x, y, z] for x in (lo[0], hi[0])
+                        for y in (lo[1], hi[1])
+                        for z in (lo[2], hi[2])], dtype=np.float32)
+    M = np.array(obj.matrix_world, dtype=np.float32)
+    w = corners @ M[:3, :3].T + M[:3, 3]
+    return cull.keep_one(w[:, 0].min(), w[:, 0].max(),
+                         w[:, 1].min(), w[:, 1].max())
+
+
+def _build_bvh_core(
     objs: List[bpy.types.Object],
-) -> Tuple[Optional[object], List[int]]:
+    cull: Optional["_AreaCull"] = None,
+) -> Tuple[Optional[object], np.ndarray]:
     """Build a BVHTree from world-space triangles of objs.
-    Returns (bvh, tri_to_obj_idx)."""
+    Returns (bvh, tri_to_obj_idx) where tri_to_obj_idx is an int32 array
+    mapping triangle index -> index into ``objs``.
+
+    When ``cull`` is given, objects and then individual triangles whose
+    XY extent misses every pixel that will be cast are dropped. Rays are
+    vertical, so this cannot change any hit -- it just keeps the sparse
+    bakes (roads at 9.4% of the tile, beaches at 1.7%) from building an
+    11M-triangle tree they barely touch.
+    """
     from mathutils.bvhtree import BVHTree
     if not objs:
-        return None, []
+        return None, _EMPTY_T[:, 0]
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    verts: List[Tuple[float, float, float]] = []
-    tris: List[Tuple[int, int, int]] = []
-    tri_to_obj_idx: List[int] = []
+    v_parts: List[np.ndarray] = []
+    t_parts: List[np.ndarray] = []
+    owner_parts: List[np.ndarray] = []
+    base = 0
 
     for oi, obj in enumerate(objs):
         if obj is None or obj.type != 'MESH':
             continue
-        ev = obj.evaluated_get(depsgraph)
-        try:
-            me = ev.to_mesh()
-        except RuntimeError:
+        # Object-level cull first: skips to_mesh()/transform entirely for
+        # anything outside the bake area.
+        if cull is not None and not _obj_overlaps_area(obj, depsgraph, cull):
             continue
-        if me is None:
+        local, tris = _obj_local_tris(obj, depsgraph)
+        if tris.shape[0] == 0:
             continue
-        try:
-            mw = obj.matrix_world.copy()
-            base = len(verts)
-            for v in me.vertices:
-                wv = mw @ v.co
-                verts.append((wv.x, wv.y, wv.z))
-            me.calc_loop_triangles()
-            for lt in me.loop_triangles:
-                vs = lt.vertices
-                tris.append((base + vs[0], base + vs[1], base + vs[2]))
-                tri_to_obj_idx.append(oi)
-        finally:
-            ev.to_mesh_clear()
+        # Applied per build so moves since extraction (e.g. the spline
+        # layer's terrain drop) are honoured.
+        M = np.array(obj.matrix_world, dtype=np.float32)
+        verts = local @ M[:3, :3].T + M[:3, 3]
 
-    if not tris:
-        return None, []
-    return BVHTree.FromPolygons(verts, tris), tri_to_obj_idx
+        if cull is not None:
+            # Triangle-level cull for meshes that straddle the area (the
+            # terrain is a single object spanning the whole region).
+            tvx = verts[:, 0][tris]
+            tvy = verts[:, 1][tris]
+            keep = cull.keep(tvx.min(axis=1), tvx.max(axis=1),
+                             tvy.min(axis=1), tvy.max(axis=1))
+            if not keep.all():
+                tris = tris[keep]
+                if tris.shape[0] == 0:
+                    continue
+                used = np.unique(tris)
+                remap = np.full(verts.shape[0], -1, dtype=np.int32)
+                remap[used] = np.arange(used.size, dtype=np.int32)
+                verts = verts[used]
+                tris = remap[tris]
+
+        v_parts.append(verts)
+        t_parts.append(tris + base)
+        owner_parts.append(np.full(tris.shape[0], oi, dtype=np.int32))
+        base += verts.shape[0]
+
+    if not t_parts:
+        return None, _EMPTY_T[:, 0]
+
+    all_verts = np.concatenate(v_parts)
+    all_tris = np.concatenate(t_parts)
+    tri_to_obj_idx = np.concatenate(owner_parts)
+    return BVHTree.FromPolygons(all_verts, all_tris), tri_to_obj_idx
+
+
+# ---------------------------------------------------------------------------
+#  BVH reuse
+# ---------------------------------------------------------------------------
+#
+# A region builds six BVHs over only four distinct object sets:
+# heightmap(landscape)+ID share one union, heightmap(water)+water coverage
+# share another.
+#
+# The cache holds exactly ONE tree, and drops the old entry *before*
+# building a new one, so peak RSS (the binding constraint on worker count)
+# is unchanged. That only pays off when the two bakes sharing a set run
+# back-to-back, which is why 4_render_spills.py interleaves them.
+_BVH_CACHE: Optional[Tuple[tuple, Tuple[str, ...], object, np.ndarray]] = None
+
+
+def clear_bvh_cache() -> None:
+    global _BVH_CACHE
+    _BVH_CACHE = None
+
+
+def _transform_signature(names: List[str]) -> bytes:
+    """Hash of the world matrices of ``names``.
+
+    Part of the cache key because bake_spline_layer lowers the terrain by
+    terrain_drop for the duration of a bake: same objects, different
+    geometry, so the tree must not be reused across that change.
+    """
+    import hashlib
+    all_objs = bpy.data.objects
+    n = len(all_objs)
+    if n == 0:
+        return b""
+    buf = np.empty(n * 16, dtype=np.float32)
+    all_objs.foreach_get("matrix_world", buf)
+    idx = _obj_index_map()
+    ids = np.fromiter((idx[nm] for nm in names if nm in idx),
+                      dtype=np.int64, count=-1)
+    m = buf.reshape(n, 16)[ids]
+    return hashlib.blake2b(m.tobytes(), digest_size=16).digest()
+
+
+def _cull_signature(cull: Optional["_AreaCull"]) -> Optional[bytes]:
+    if cull is None:
+        return None
+    import hashlib
+    return hashlib.blake2b(cull.integral.tobytes(), digest_size=16).digest()
+
+
+def _build_bvh_from_objs(
+    objs: List[bpy.types.Object],
+    cull: Optional["_AreaCull"] = None,
+) -> Tuple[Optional[object], np.ndarray]:
+    """Cached front end to :func:`_build_bvh_core`.
+
+    The cache key is order-independent (names sorted), but the tree is
+    built in whatever order the *first* caller passed, so that caller is
+    completely unaffected. A later caller holding the same set in a
+    different order reuses the tree and only remaps tri_to_obj_idx into
+    its own ordering -- one numpy gather instead of a ~9s rebuild.
+    """
+    global _BVH_CACHE
+
+    names = [o.name for o in objs if o is not None]
+    # Duplicate names would make the built<->caller remap ambiguous, so
+    # such a call simply goes uncached.
+    if not BVH_CACHE_REUSE or not names or len(set(names)) != len(names):
+        return _build_bvh_core(objs, cull=cull)
+
+    key = (tuple(sorted(names)), _transform_signature(sorted(names)),
+           _cull_signature(cull))
+
+    cached = _BVH_CACHE
+    if cached is not None and cached[0] == key:
+        _, built_names, bvh, tri_to_built = cached
+        if bvh is None:
+            return None, _EMPTY_T[:, 0]
+        caller_index = {o.name: i for i, o in enumerate(objs) if o is not None}
+        perm = np.full(len(built_names), -1, dtype=np.int32)
+        for k, nm in enumerate(built_names):
+            if nm is not None:
+                perm[k] = caller_index.get(nm, -1)
+        print(f"  [bvh] reusing cached tree ({len(tri_to_built):,} tris, "
+              f"{len(names)} objects)")
+        return bvh, perm[tri_to_built]
+
+    # Drop the previous tree before building so peak memory matches the
+    # uncached path -- RSS, not CPU, is what caps worker count.
+    _BVH_CACHE = None
+
+    bvh, tri_to_built = _build_bvh_core(objs, cull=cull)
+    built_names = tuple(o.name if o is not None else None for o in objs)
+    _BVH_CACHE = (key, built_names, bvh, tri_to_built)
+    return bvh, tri_to_built
+
+
+def _row_pool_size() -> int:
+    """Threads to use for the per-row raycast pools.
+
+    ``BVHTree.ray_cast`` releases the GIL, but the Python around it (the
+    per-subsample loop in the row functions) does not, so a worker gets
+    nowhere near linear speedup from its thread pool. When several render
+    workers run at once, giving each of them ``os.cpu_count()`` threads
+    oversubscribes the machine several times over. Budget the cores
+    across the workers instead.
+
+    ``FH_BAKE_THREADS`` in the environment wins when set (the parent
+    process stamps it in before fanning out); otherwise fall back to the
+    BAKE_ROW_THREADS config value, then to an even split.
+    """
+    env = os.environ.get("FH_BAKE_THREADS")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    if BAKE_ROW_THREADS > 0:
+        return max(1, int(BAKE_ROW_THREADS))
+    cores = os.cpu_count() or 4
+    return max(2, cores // max(1, NUM_WORKERS_SPILLS))
 
 
 def _bake_rows_parallel(mask: np.ndarray, row_fn: Callable[[int], None]) -> None:
-    """Run row_fn(i) on every row with any True pixel via a thread pool.
-    BVHTree.ray_cast releases the GIL, giving near-linear speedup."""
+    """Run row_fn(i) on every row with any True pixel via a thread pool."""
     rows = [i for i in range(mask.shape[0]) if mask[i].any()]
-    workers = max(1, (os.cpu_count() or 4))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    with ThreadPoolExecutor(max_workers=_row_pool_size()) as ex:
         list(ex.map(row_fn, rows))
 
 
@@ -253,10 +629,11 @@ def raycast_heightmap(
         seen.add(o.name)
         all_objs.append(o)
 
-    bvh, tri_to_obj_idx = _build_bvh_from_objs(all_objs)
+    bvh, tri_to_obj_idx = _build_bvh_from_objs(
+        all_objs, cull=area_cull_for(mask))
     out = np.zeros((BAKE_IMG_SIZE, BAKE_IMG_SIZE), dtype=np.uint16)
 
-    if bvh is not None and tri_to_obj_idx:
+    if bvh is not None and len(tri_to_obj_idx):
         occluder_names = {o.name for o in occluders}
         is_occ = np.asarray(
             [all_objs[oi].name in occluder_names for oi in range(len(all_objs))],
@@ -316,10 +693,11 @@ def raycast_id_map(
         flat_objs.append(o)
         obj_color.append((0, 0, 0))
 
-    bvh, tri_to_obj_idx = _build_bvh_from_objs(flat_objs)
+    bvh, tri_to_obj_idx = _build_bvh_from_objs(
+        flat_objs, cull=area_cull_for(mask))
     out = np.zeros((BAKE_IMG_SIZE, BAKE_IMG_SIZE, 3), dtype=np.uint8)
 
-    if bvh is not None and tri_to_obj_idx:
+    if bvh is not None and len(tri_to_obj_idx):
         tri_to_obj_np = np.asarray(tri_to_obj_idx, dtype=np.int32)
         color_np = np.asarray(obj_color, dtype=np.uint8)
         X, Y = _bake_pixel_world_xy()
@@ -360,10 +738,11 @@ def raycast_binary_mask(
         seen.add(o.name)
         all_objs.append(o)
 
-    bvh, tri_to_obj_idx = _build_bvh_from_objs(all_objs)
+    bvh, tri_to_obj_idx = _build_bvh_from_objs(
+        all_objs, cull=area_cull_for(mask))
     out = np.zeros((BAKE_IMG_SIZE, BAKE_IMG_SIZE, 3), dtype=np.uint8)
 
-    if bvh is not None and tri_to_obj_idx:
+    if bvh is not None and len(tri_to_obj_idx):
         target_names = {o.name for o in target_objs}
         is_target = np.asarray(
             [all_objs[oi].name in target_names for oi in range(len(all_objs))],
@@ -431,10 +810,11 @@ def raycast_id_ssaa_per_category(
         flat_objs.append(o)
         obj_cat_idx.append(-1)  # blocker
 
-    bvh, tri_to_obj_idx = _build_bvh_from_objs(flat_objs)
+    bvh, tri_to_obj_idx = _build_bvh_from_objs(
+        flat_objs, cull=area_cull_for(mask))
     acc = np.zeros((n_cats, BAKE_IMG_SIZE, BAKE_IMG_SIZE), dtype=np.uint16)
 
-    if bvh is not None and tri_to_obj_idx:
+    if bvh is not None and len(tri_to_obj_idx):
         tri_to_obj_np = np.asarray(tri_to_obj_idx, dtype=np.int32)
         cat_idx_np = np.asarray(obj_cat_idx, dtype=np.int32)
         px = BAKE_PIXEL_SIZE_M
@@ -523,10 +903,11 @@ def raycast_split_layer_rgba(
         flat_objs.append(o)
         is_target.append(False)
 
-    bvh, tri_to_obj_idx = _build_bvh_from_objs(flat_objs)
+    bvh, tri_to_obj_idx = _build_bvh_from_objs(
+        flat_objs, cull=area_cull_for(mask))
     out = np.zeros((BAKE_IMG_SIZE, BAKE_IMG_SIZE, 4), dtype=np.uint8)
 
-    if bvh is not None and tri_to_obj_idx:
+    if bvh is not None and len(tri_to_obj_idx):
         tri_to_obj_np = np.asarray(tri_to_obj_idx, dtype=np.int32)
         is_target_np = np.asarray(is_target, dtype=bool)
         px = BAKE_PIXEL_SIZE_M
@@ -635,10 +1016,11 @@ def raycast_coverage_rgba(
     ]
     mask = _mask_restricted_to_targets(mask, target_only_objs, margin_px=4)
 
-    bvh, tri_to_obj_idx = _build_bvh_from_objs(flat_objs)
+    bvh, tri_to_obj_idx = _build_bvh_from_objs(
+        flat_objs, cull=area_cull_for(mask))
     out = np.zeros((BAKE_IMG_SIZE, BAKE_IMG_SIZE, 4), dtype=np.uint8)
 
-    if bvh is not None and tri_to_obj_idx and mask.any():
+    if bvh is not None and len(tri_to_obj_idx) and mask.any():
         tri_to_obj_np = np.asarray(tri_to_obj_idx, dtype=np.int32)
         color_np = np.asarray(obj_color, dtype=np.uint16)
         is_target_np = np.asarray(is_target, dtype=bool)
@@ -828,9 +1210,12 @@ def _enable_cycles_gpu(scene) -> None:
                 chosen = backend
                 for d in devs:
                     d.use = True
+                # CPU devices are deliberately left off unless asked for:
+                # hybrid rendering steals cores from the other workers'
+                # raycast bakes for a few percent on this render.
                 try:
                     for d in prefs.get_devices_for_type("CPU"):
-                        d.use = True
+                        d.use = bool(CYCLES_USE_CPU_WITH_GPU)
                 except Exception:
                     pass
                 break
@@ -843,6 +1228,14 @@ def _enable_cycles_gpu(scene) -> None:
 
     try:
         scene.cycles.device = 'GPU'
+    except (AttributeError, TypeError):
+        pass
+
+    # Bound Cycles' own CPU threads to this worker's share, so a CPU
+    # fallback (or any residual CPU-side work) can't stampede the box.
+    try:
+        scene.cycles.threads_mode = 'FIXED'
+        scene.cycles.threads = _row_pool_size()
     except (AttributeError, TypeError):
         pass
 
@@ -1008,7 +1401,8 @@ def render_ao(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     scene.render.filepath = output_path
-    bpy.ops.render.render(write_still=True)
+    with gpu_slot("AO"):
+        bpy.ops.render.render(write_still=True)
 
     _restore_hide(prev_hidden, "hide_render")
     scene.render.engine = prev["engine"]
@@ -1096,6 +1490,7 @@ def _build_rim_multiplier_png(
     target_objs: List[bpy.types.Object],
     tmp_path: str,
     size: int = BAKE_IMG_SIZE,
+    footprint: Optional[np.ndarray] = None,
 ) -> bool:
     """Write a grayscale rim-multiplier PNG for the given targets.
 
@@ -1112,9 +1507,10 @@ def _build_rim_multiplier_png(
     with colorspace 'Non-Color' so the stored byte value is used as-is
     as a linear multiplier.
     """
-    footprint = _rasterize_targets_footprint(
-        target_objs, size=size, margin_px=0,
-    )
+    if footprint is None:
+        footprint = _rasterize_targets_footprint(
+            target_objs, size=size, margin_px=0,
+        )
     if not footprint.any():
         return False
     inside = footprint.astype(np.uint8) * 255
@@ -1380,13 +1776,19 @@ def render_split_layers_ao(
                     layer_target_objs.append(o)
 
             # Un-hide just this layer's targets for the render.
-            for o in layer_target_objs:
-                o.hide_render = False
+            _set_hide_bulk(layer_target_objs, False, "hide_render")
 
             try:
-                footprint = _rasterize_targets_footprint(
-                    layer_target_objs, size=size, margin_px=16,
+                # Rasterise once at margin 0; the margin-16 version the
+                # render border needs is a cheap dilation of it, and the
+                # tight one is reused by the rim multiplier below.
+                footprint_tight = _rasterize_targets_footprint(
+                    layer_target_objs, size=size, margin_px=0,
                 )
+                _k = np.ones((33, 33), dtype=np.uint8)
+                footprint = cv2.dilate(
+                    footprint_tight.astype(np.uint8), _k
+                ) > 0
                 if not footprint.any():
                     blank = np.zeros((size, size, 4), dtype=np.uint8)
                     write_png8_rgba(output_path, blank)
@@ -1421,9 +1823,11 @@ def render_split_layers_ao(
                             rim_tmp_dir,
                             f"rim_{layer_stem}.png",
                         )
-                        if _build_rim_multiplier_png(
+                        _rim_ok = _build_rim_multiplier_png(
                             layer_target_objs, rim_png, size=size,
-                        ):
+                            footprint=footprint_tight,
+                        )
+                        if _rim_ok:
                             rim_img_blender = bpy.data.images.load(
                                 rim_png, check_existing=False,
                             )
@@ -1440,7 +1844,8 @@ def render_split_layers_ao(
 
                     try:
                         scene.render.filepath = output_path
-                        bpy.ops.render.render(write_still=True)
+                        with gpu_slot("split-layer"):
+                            bpy.ops.render.render(write_still=True)
                     finally:
                         if edge_tex_node is not None:
                             edge_tex_node.image = None
@@ -1453,11 +1858,10 @@ def render_split_layers_ao(
                 written.append(output_path)
             finally:
                 # Re-hide this layer's targets before moving on.
-                for o in layer_target_objs:
-                    try:
-                        o.hide_render = True
-                    except ReferenceError:
-                        pass
+                try:
+                    _set_hide_bulk(layer_target_objs, True, "hide_render")
+                except ReferenceError:
+                    pass
 
             _apply_mask_to_image_file(output_path, mask, preserve_alpha=True)
     finally:
