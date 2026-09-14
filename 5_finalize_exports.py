@@ -62,9 +62,12 @@ from utils.config import (
     SVG_LAYERS,
     SVG_LAYERS_DIR,
     TILE_HALF,
+    TILE_SIZE,
     HM_SPLIT_M,
     FLY_ALERT_MIN_M,
     FLY_ALERT_MAX_M,
+    assert_height_offsets_match,
+    height_offset_cm,
 )
 
 
@@ -270,6 +273,42 @@ def stitch(
     return canvas
 
 
+def build_height_offset_m(
+    centres: Dict[str, Tuple[int, int]],
+    mask: np.ndarray,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Per-pixel copy of the Z offset (m) Exporter.exe baked into each region.
+
+    Laid out with the same tiling and hex mask as stitch(), so subtracting it
+    from a stitched heightmap recovers the raw in-game world Z that the
+    altimeter reads. See config.HEIGHT_OFFSETS_CM for why that matters.
+
+    Overlaps resolve with np.maximum, matching stitch(). The hex mask makes
+    tiles all but disjoint, and every offset is well under a metre apart
+    anyway, so the choice only ever moves a border pixel by centimetres.
+    """
+    assert_height_offsets_match()
+    canvas = np.zeros((height, width), dtype=np.float32)
+    applied = 0
+
+    for name, (cx, cy) in centres.items():
+        offset_m = height_offset_cm(name) / 100.0
+        if offset_m == 0.0:
+            continue
+        tile = _apply_hex_mask(
+            np.full((TILE_SIZE, TILE_SIZE), offset_m, dtype=np.float32), mask)
+        dst = canvas[cy - TILE_HALF: cy + TILE_HALF,
+                     cx - TILE_HALF: cx + TILE_HALF]
+        np.maximum(dst, tile, out=dst)
+        applied += 1
+
+    print(f"  height offsets applied to {applied}/{len(centres)} regions "
+          f"(max {canvas.max():.2f} m)")
+    return canvas
+
+
 # ------------------------------------------------------------------------------
 #  Heightmap-derived products (landscape + water)
 # ------------------------------------------------------------------------------
@@ -312,10 +351,15 @@ def build_fly_alert(
     width: int,
     rocks_cov: np.ndarray | None,
     out_path: Path,
+    offset_m: np.ndarray | None = None,
 ) -> None:
     print("  building fly_alert...")
     void = raw_landscape == 0
     meters = (raw_landscape.astype(np.float32) - 32768.0) / 100.0
+    # FLY_ALERT_MIN_M/MAX_M are in-game altimeter metres, which the game reads
+    # as raw world Z. Undo the per-region seam normalisation to get there.
+    if offset_m is not None:
+        meters -= offset_m
     denom = max(FLY_ALERT_MAX_M - FLY_ALERT_MIN_M, 1e-6)
     fly_ratio = (meters - FLY_ALERT_MIN_M) / denom
     fly_alert = np.clip(np.round(fly_ratio * 255.0), 0, 255).astype(np.uint8)
@@ -880,6 +924,11 @@ class Ctx:
                                       self.height, self.width)
 
     @cached_property
+    def height_offset_m(self) -> np.ndarray:
+        return build_height_offset_m(self.centres, self.mask,
+                                     self.height, self.width)
+
+    @cached_property
     def highs_lows(self):
         if self.raw_landscape is None:
             return None, None
@@ -1056,7 +1105,8 @@ def _run_fly_alert(ctx: Ctx) -> None:
         return
     build_fly_alert(ctx.raw_landscape, ctx.height, ctx.width,
                     ctx.id_coverage.get("rocks"),
-                    _final(f"{ASSEMBLY_DIR}/fly_alert.png"))
+                    _final(f"{ASSEMBLY_DIR}/fly_alert.png"),
+                    ctx.height_offset_m)
 
 
 def _run_contour(ctx: Ctx) -> None:
@@ -1174,7 +1224,7 @@ STAGES: List[Stage] = [
           lambda: [_final(f"{ASSEMBLY_DIR}/fly_alert.png")],
           lambda: [HM_LANDSCAPE_DIR, ID_DIR / "rocks",
                    FLY_ALERT_PATTERN_FILE],
-          needs=("raw_landscape", "id_coverage")),
+          needs=("raw_landscape", "id_coverage", "height_offset_m")),
     Stage("contour", "technical/contour.png", _run_contour,
           lambda: [_final(f"{TECHNICAL_DIR}/contour.png")],
           lambda: [HM_LANDSCAPE_DIR, ID_DIR / "terrain"],

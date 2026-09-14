@@ -1,10 +1,70 @@
 """PNG read/write helpers (16-bit gray, 8-bit gray/RGB/RGBA)."""
 
+import os
 import struct
 import zlib
-from typing import Tuple
+from contextlib import contextmanager
+from typing import Iterator, Tuple
 
 import numpy as np
+
+
+def partial_path(path: str) -> str:
+    """The sibling temp name atomic_png() writes to. Keeps a ``.png`` suffix
+    so Blender's use_file_extension does not append one when it is handed to
+    scene.render.filepath, and a ``.partial`` stem so no stitcher glob or
+    per-region lookup ever mistakes a leftover for a finished bake."""
+    root, ext = os.path.splitext(path)
+    return f"{root}.partial{ext or '.png'}"
+
+
+def unlink_quiet(path: str) -> None:
+    """Delete ``path`` if present, ignoring failures."""
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+@contextmanager
+def atomic_png(path: str) -> Iterator[str]:
+    """Yield a sibling ``<name>.partial.png`` to write, then rename it over
+    ``path``.
+
+    A bake PNG takes seconds to encode (and a Cycles render far longer);
+    written straight to its final name, a Ctrl+C mid-write leaves a
+    truncated file carrying a fresh mtime, which every downstream
+    existence/mtime check -- the step-4 progress tracker, step-5's
+    Stage.up_to_date(), the stitcher -- reads as a finished bake. The
+    rename is atomic, so an interrupt leaves either the previous output
+    or none, both of which read as "not done".
+
+    """
+    tmp = partial_path(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    try:
+        yield tmp
+        os.replace(tmp, path)
+    finally:
+        unlink_quiet(tmp)
+
+
+def imwrite_atomic(path: str, img: np.ndarray) -> None:
+    """cv2.imwrite through atomic_png(). Raises OSError if the encode fails."""
+    import cv2
+
+    with atomic_png(path) as tmp:
+        # cv2 signals a bad extension by raising cv2.error and an encode
+        # failure by returning False; callers only have to catch OSError.
+        try:
+            wrote = cv2.imwrite(tmp, img)
+        except cv2.error as exc:
+            raise OSError(f"cv2 failed to write {tmp}: {exc}") from exc
+        if not wrote:
+            raise OSError(f"cv2 failed to write {tmp}")
 
 
 def read_png16_gray(path: str) -> Tuple[int, int, np.ndarray]:
@@ -109,13 +169,14 @@ def _write_png(path: str, w: int, h: int, depth: int, ctype: int,
         raw.append(0)
         raw += row_bytes[y * row_len:(y + 1) * row_len]
     idat = zlib.compress(bytes(raw), level=6)
-    with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n")
-        f.write(_png_chunk(
-            b"IHDR", struct.pack(">IIBBBBB", w, h, depth, ctype, 0, 0, 0)
-        ))
-        f.write(_png_chunk(b"IDAT", idat))
-        f.write(_png_chunk(b"IEND", b""))
+    with atomic_png(path) as tmp:
+        with open(tmp, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n")
+            f.write(_png_chunk(
+                b"IHDR", struct.pack(">IIBBBBB", w, h, depth, ctype, 0, 0, 0)
+            ))
+            f.write(_png_chunk(b"IDAT", idat))
+            f.write(_png_chunk(b"IEND", b""))
 
 
 def write_png16_gray(path: str, arr: np.ndarray) -> None:

@@ -48,6 +48,9 @@ namespace Exporter
             public double ScaleX, ScaleY;
             public double ScaleZ;
             public double R00, R01, R10, R11;
+            // Third row of the rotation matrix – the part that turns a pitch/roll
+            // tilt into a height contribution. Zero for every axis-aligned landscape.
+            public double R20, R21, R22;
 
             public int SectionOffsetX, SectionOffsetY;
             public int MinX, MinY, MaxX, MaxY;
@@ -69,17 +72,7 @@ namespace Exporter
                 if (obj is not ALandscapeProxy proxy) continue;
 
                 var info = BuildInfo(proxy);
-                if (info != null)
-                {
-                    double zFix = Constants.GetProxyZCorrection(mapName, info.Name);
-                    if (zFix != 0.0)
-                    {
-                        Log.Information("  Applying per-proxy Z correction of {0} cm to '{1}' ({2} → {3}).",
-                            zFix, info.Name, info.LocZ, info.LocZ + zFix);
-                        info.LocZ += zFix;
-                    }
-                    infos.Add(info);
-                }
+                if (info != null) infos.Add(info);
             }
 
             if (infos.Count == 0)
@@ -134,6 +127,32 @@ namespace Exporter
                         info.ScaleX, info.ScaleY,
                         Math.Atan2(info.R10, info.R00) * 180.0 / Math.PI,
                         info.SectionOffsetX, info.SectionOffsetY);
+
+                    // A tilted proxy pivots about local quad (0,0); surface it because the
+                    // resulting height contribution is easy to mistake for a bad LocZ.
+                    double TiltAt(int qx, int qy) =>
+                        info.R20 * (qx - info.SectionOffsetX) * info.ScaleX +
+                        info.R21 * (qy - info.SectionOffsetY) * info.ScaleY;
+
+                    // Sample all four corners: with opposite-signed pitch and roll the
+                    // extremes sit on the off-diagonal corners, not on min/min and max/max.
+                    double[] tilts =
+                    [
+                        TiltAt(info.MinX, info.MinY), TiltAt(info.MaxX, info.MinY),
+                        TiltAt(info.MinX, info.MaxY), TiltAt(info.MaxX, info.MaxY),
+                    ];
+                    double tiltMin = tilts.Min(), tiltMax = tilts.Max();
+
+                    if (Math.Abs(tiltMin) > 1.0 || Math.Abs(tiltMax) > 1.0)
+                    {
+                        Log.Information(
+                            "    '{0}' is tilted (pitch={1:F4}°, roll={2:F4}°); " +
+                            "tilt adds {3:F0} to {4:F0} cm of height across its extent.",
+                            info.Name,
+                            Math.Asin(Math.Clamp(info.R20, -1.0, 1.0)) * 180.0 / Math.PI,
+                            Math.Atan2(-info.R21, info.R22) * 180.0 / Math.PI,
+                            tiltMin, tiltMax);
+                    }
 
                     bool ok;
                     Dictionary<string, Image>    heightMaps;
@@ -330,6 +349,7 @@ namespace Exporter
                 ScaleZ          = scale.Z,
                 R00             = R[0, 0], R01 = R[0, 1],
                 R10             = R[1, 0], R11 = R[1, 1],
+                R20             = R[2, 0], R21 = R[2, 1], R22 = R[2, 2],
                 SectionOffsetX  = proxy.LandscapeSectionOffset.X,
                 SectionOffsetY  = proxy.LandscapeSectionOffset.Y,
                 MinX            = minX, MinY = minY,
@@ -345,8 +365,23 @@ namespace Exporter
         {
             int srcW = src.Width, srcH = src.Height;
 
-            // UE4 formula: height_cm = (raw - 32768) * LANDSCAPE_ZSCALE * scaleZ
-            // Stored as: output_raw = height_cm + 32768 (32768 = zero height)
+            // UE4 formula: local height_cm = (raw - 32768) * LANDSCAPE_ZSCALE * scaleZ,
+            // then the proxy transform takes it to world Z:
+            //   worldZ = LocZ + R20*lx + R21*ly + R22*localZ
+            // where (lx, ly) is the position within the landscape in local cm. The
+            // R20/R21 terms only matter when the proxy has a pitch/roll tilt, but then
+            // they matter a lot: the actor pivots about local quad (0,0), which can sit
+            // kilometres outside the components, so a fraction of a degree becomes
+            // metres of height (GodCrofts' CentreIslandLandscape2 is tilted -0.32° in
+            // roll and lifts by 262–555 cm across the patch).
+            // Baking world Z here rather than in the destination loop keeps the later
+            // bilinear sampling correct – it is interpolating an already-linear quantity.
+            // Stored as: output_raw = worldZ + 32768 (32768 = zero height)
+            double qSpanX = info.MaxX - info.MinX;
+            double qSpanY = info.MaxY - info.MinY;
+            double quadsPerPxX = srcW > 1 ? qSpanX / (srcW - 1) : 0.0;
+            double quadsPerPxY = srcH > 1 ? qSpanY / (srcH - 1) : 0.0;
+
             var srcPixels = new ushort[srcW * srcH];
             double minH = double.PositiveInfinity, maxH = double.NegativeInfinity;
             src.ProcessPixelRows(acc =>
@@ -354,13 +389,22 @@ namespace Exporter
                 for (int y = 0; y < srcH; y++)
                 {
                     var row = acc.GetRowSpan(y);
+
+                    double lqy = info.MinY + y * quadsPerPxY;
+                    double ly  = (lqy - info.SectionOffsetY) * info.ScaleY;
+                    double rowZ = info.LocZ + info.R21 * ly + zOffsetCm;
+
                     for (int x = 0; x < srcW; x++)
                     {
                         ushort raw = row[x].PackedValue;
                         // 0 is the UE4 "no-data" sentinel – preserve it so it never overwrites valid height data.
                         if (raw == 0) { srcPixels[y * srcW + x] = 0; continue; }
-                        double heightCm = (raw - 32768) * LandscapeZScale * info.ScaleZ + info.LocZ
-                                          + zOffsetCm;
+
+                        double lqx = info.MinX + x * quadsPerPxX;
+                        double lx  = (lqx - info.SectionOffsetX) * info.ScaleX;
+                        double localZ = (raw - 32768) * LandscapeZScale * info.ScaleZ;
+
+                        double heightCm = rowZ + info.R20 * lx + info.R22 * localZ;
 
                         if (heightCm < -10_000.0) { srcPixels[y * srcW + x] = 0; continue; }
 
