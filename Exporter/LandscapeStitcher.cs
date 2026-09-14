@@ -47,10 +47,20 @@ namespace Exporter
             public double LocX, LocY, LocZ;
             public double ScaleX, ScaleY;
             public double ScaleZ;
-            public double R00, R01, R10, R11;
-            // Third row of the rotation matrix – the part that turns a pitch/roll
-            // tilt into a height contribution. Zero for every axis-aligned landscape.
+            // The rotation matrix, in full. Scattering forward only ever multiplies by it,
+            // so unlike the inverse mapping it needs no special case for a tilted proxy:
+            // the third column (world XY <- local Z) and third row (world Z <- local XY)
+            // simply carry their terms like any other.
+            public double R00, R01, R02;
+            public double R10, R11, R12;
             public double R20, R21, R22;
+
+            // Local-space height of every source heightmap texel, in cm, kept so the
+            // weightmap grid - which has its own resolution - can find the surface it sits
+            // on. Null when the proxy's heightmap failed to convert.
+            public float[]? LocalZCm;
+            public bool[]?  LocalZValid;
+            public int      LzW, LzH;
 
             public int SectionOffsetX, SectionOffsetY;
             public int MinX, MinY, MaxX, MaxY;
@@ -108,6 +118,16 @@ namespace Exporter
             double zOffsetCm = Constants.GetHeightOffset(mapName);
             if (zOffsetCm != 0.0)
                 Log.Information("Applying Z offset of {0} cm to '{1}'.", zOffsetCm, mapName);
+
+            // One depth buffer per output grid, holding the world Z in cm of whichever
+            // surface owns each pixel (NoDepth until something claims it). Every surface is
+            // projected forward into these and the highest sample wins the pixel outright -
+            // its height and all of its materials - which is what the game's own depth test
+            // does when it draws the landscapes from above.
+            var heightZ = new float[HmOutputSize * HmOutputSize];
+            var layerZ  = new float[WmOutputSize * WmOutputSize];
+            Array.Fill(heightZ, NoDepth);
+            Array.Fill(layerZ,  NoDepth);
 
             using var heightDst = new Image<L16>(HmOutputSize, HmOutputSize);
             var weightDsts = allPhysNames.ToDictionary(
@@ -185,12 +205,32 @@ namespace Exporter
                         info.SrcH = hImgBase.Height;
 
                         if (hImgBase is Image<L16> hImg)
-                            BlitHeightmap(info, hImg, heightDst, zOffsetCm);
+                            ReadHeightSource(info, hImg);
                         else
                             Log.Warning("    Unexpected heightmap pixel format for '{0}'.", info.Name);
 
                         hImgBase.Dispose();
                     }
+
+                    if (info.LocalZCm == null)
+                    {
+                        Log.Warning("    '{0}' has no usable heightmap; nothing to project.",
+                            info.Name);
+                        foreach (var (_, bm) in weightMaps) bm.Dispose();
+                        continue;
+                    }
+
+                    // The height grid drives the heightmap output directly.
+                    var heightSurface = BuildSurface(
+                        info, info.LzW, info.LzH, info.LocalZCm, info.LocalZValid!, zOffsetCm);
+                    ScatterHeights(heightSurface, heightZ);
+
+                    // Gather the proxy's layers before projecting any of them. The depth test
+                    // decides per pixel which surface is visible, and that verdict has to
+                    // apply to every material at once - projecting layers one at a time would
+                    // let different layers of one pixel come from different surfaces.
+                    var srcLayers = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+                    int wmW = 0, wmH = 0;
 
                     foreach (var (rawName, srcBm) in weightMaps)
                     {
@@ -198,14 +238,58 @@ namespace Exporter
                         { srcBm.Dispose(); continue; }
 
                         if (info.SrcW == 0) { info.SrcW = srcBm.Width; info.SrcH = srcBm.Height; }
+                        if (wmW == 0) { wmW = srcBm.Width; wmH = srcBm.Height; }
+
+                        if (srcBm.Width != wmW || srcBm.Height != wmH)
+                        {
+                            Log.Warning("    '{0}' layer '{1}' is {2}x{3}, expected {4}x{5}; skipping.",
+                                info.Name, rawName, srcBm.Width, srcBm.Height, wmW, wmH);
+                            srcBm.Dispose();
+                            continue;
+                        }
 
                         if (!info.LayerToPhys.TryGetValue(rawName, out var physName))
                             physName = rawName;
 
-                        if (weightDsts.TryGetValue(physName, out var dstBm))
-                            BlitWeightmap(info, srcBm, dstBm);
+                        if (weightDsts.ContainsKey(physName))
+                        {
+                            var arr = CopyGray8(srcBm);
+                            // Several raw layers can resolve to one physical material;
+                            // combine them within the proxy before the depth test sees them.
+                            if (srcLayers.TryGetValue(physName, out var existing))
+                                for (int i = 0; i < existing.Length; i++)
+                                    existing[i] = Math.Max(existing[i], arr[i]);
+                            else
+                                srcLayers[physName] = arr;
+                        }
 
                         srcBm.Dispose();
+                    }
+
+                    // Unpainted texels are not holes to the game - see FillUnpainted - so
+                    // resolve them here, while the proxy's own component grid is still in
+                    // hand and every consumer downstream can just read the layers.
+                    int gridW = info.MaxX - info.MinX + 1;
+                    int gridH = info.MaxY - info.MinY + 1;
+
+                    if (wmW == 0 && wmH == 0) { wmW = gridW; wmH = gridH; }
+
+                    if (wmW == gridW && wmH == gridH)
+                        FillUnpainted(info, srcLayers, weightDsts, wmW, wmH);
+                    else
+                        Log.Warning(
+                            "    '{0}' weightmap grid is {1}×{2}, expected {3}×{4}; " +
+                            "leaving unpainted texels alone.",
+                            info.Name, wmW, wmH, gridW, gridH);
+
+                    if (srcLayers.Count > 0)
+                    {
+                        // The weightmap grid has its own resolution, so it gets its own
+                        // projected surface, sampled off the height grid underneath it.
+                        var layerSurface = (wmW == info.LzW && wmH == info.LzH)
+                            ? heightSurface
+                            : BuildSurfaceFromHeightGrid(info, wmW, wmH, zOffsetCm);
+                        ScatterLayers(layerSurface, srcLayers, weightDsts, layerZ);
                     }
 
                     Log.Information("    Done '{0}': src {1}×{2}.", info.Name, info.SrcW, info.SrcH);
@@ -213,6 +297,8 @@ namespace Exporter
 
                 string hmDir = Path.Combine(exportFolder, "_heightmap");
                 Directory.CreateDirectory(hmDir);
+
+                EncodeHeights(heightZ, heightDst);
 
                 string hPath = Path.Combine(hmDir, mapName + ".png");
                 using (var fs = File.OpenWrite(hPath))
@@ -347,8 +433,8 @@ namespace Exporter
                 ScaleX          = scale.X,
                 ScaleY          = scale.Y,
                 ScaleZ          = scale.Z,
-                R00             = R[0, 0], R01 = R[0, 1],
-                R10             = R[1, 0], R11 = R[1, 1],
+                R00             = R[0, 0], R01 = R[0, 1], R02 = R[0, 2],
+                R10             = R[1, 0], R11 = R[1, 1], R12 = R[1, 2],
                 R20             = R[2, 0], R21 = R[2, 1], R22 = R[2, 2],
                 SectionOffsetX  = proxy.LandscapeSectionOffset.X,
                 SectionOffsetY  = proxy.LandscapeSectionOffset.Y,
@@ -358,244 +444,466 @@ namespace Exporter
             };
         }
 
+        // Depth sentinel for quads UE marks as having no height. Far below any real
+        // terrain, and far below the -10000 cm floor the heightmap output clamps at, so a
+        // genuine surface always outranks it. NoDepthTest is the threshold to compare
+        // against, loose enough that a bilinear tap partly over the sentinel still reads
+        // as no-data.
+        // Claimed by nothing yet. Far below any real terrain and below the -10000 cm
+        // floor the heightmap output clamps at, so any genuine surface outranks it.
+        private const float  NoDepth     = -1e9f;
+        private const double NoDepthTest = -1e8;
+
+        // Heights below this are dropped from the heightmap output rather than written.
+        private const double HeightFloorCm = -10_000.0;
+
         private const double LandscapeZScale = 1.0 / 128.0;
 
-        private static void BlitHeightmap(LandscapeInfo info, Image<L16> src, Image<L16> dst,
-                                           double zOffsetCm = 0.0)
+        // A surface projected into world space: one world position per source texel, plus
+        // which texels UE actually has data for.
+        private sealed class Surface
+        {
+            public int      W, H;
+            public double[] Wx = [];     // world X, cm
+            public double[] Wy = [];     // world Y, cm
+            public double[] Wz = [];     // world Z, cm - unclamped, so depth tests stay
+                                         // meaningful below the heightmap's output floor
+            public bool[]   Valid = [];
+        }
+
+        // Decodes the raw heightmap into local-space height, and records which texels carry
+        // data. Nothing is projected here - that is BuildSurface's job - because the
+        // weightmap grid needs these local heights too, at its own resolution.
+        private static void ReadHeightSource(LandscapeInfo info, Image<L16> src)
         {
             int srcW = src.Width, srcH = src.Height;
+            var localZs = new float[srcW * srcH];
+            var valid   = new bool[srcW * srcH];
 
-            // UE4 formula: local height_cm = (raw - 32768) * LANDSCAPE_ZSCALE * scaleZ,
-            // then the proxy transform takes it to world Z:
-            //   worldZ = LocZ + R20*lx + R21*ly + R22*localZ
-            // where (lx, ly) is the position within the landscape in local cm. The
-            // R20/R21 terms only matter when the proxy has a pitch/roll tilt, but then
-            // they matter a lot: the actor pivots about local quad (0,0), which can sit
-            // kilometres outside the components, so a fraction of a degree becomes
-            // metres of height (GodCrofts' CentreIslandLandscape2 is tilted -0.32° in
-            // roll and lifts by 262–555 cm across the patch).
-            // Baking world Z here rather than in the destination loop keeps the later
-            // bilinear sampling correct – it is interpolating an already-linear quantity.
-            // Stored as: output_raw = worldZ + 32768 (32768 = zero height)
-            double qSpanX = info.MaxX - info.MinX;
-            double qSpanY = info.MaxY - info.MinY;
-            double quadsPerPxX = srcW > 1 ? qSpanX / (srcW - 1) : 0.0;
-            double quadsPerPxY = srcH > 1 ? qSpanY / (srcH - 1) : 0.0;
-
-            var srcPixels = new ushort[srcW * srcH];
-            double minH = double.PositiveInfinity, maxH = double.NegativeInfinity;
             src.ProcessPixelRows(acc =>
             {
                 for (int y = 0; y < srcH; y++)
                 {
                     var row = acc.GetRowSpan(y);
-
-                    double lqy = info.MinY + y * quadsPerPxY;
-                    double ly  = (lqy - info.SectionOffsetY) * info.ScaleY;
-                    double rowZ = info.LocZ + info.R21 * ly + zOffsetCm;
-
                     for (int x = 0; x < srcW; x++)
                     {
                         ushort raw = row[x].PackedValue;
-                        // 0 is the UE4 "no-data" sentinel – preserve it so it never overwrites valid height data.
-                        if (raw == 0) { srcPixels[y * srcW + x] = 0; continue; }
+                        // 0 is the UE4 no-data sentinel.
+                        if (raw == 0) continue;
 
-                        double lqx = info.MinX + x * quadsPerPxX;
-                        double lx  = (lqx - info.SectionOffsetX) * info.ScaleX;
-                        double localZ = (raw - 32768) * LandscapeZScale * info.ScaleZ;
-
-                        double heightCm = rowZ + info.R20 * lx + info.R22 * localZ;
-
-                        if (heightCm < -10_000.0) { srcPixels[y * srcW + x] = 0; continue; }
-
-                        if (heightCm < minH) minH = heightCm;
-                        if (heightCm > maxH) maxH = heightCm;
-
-                        double encoded  = heightCm + 32768.0;
-                        srcPixels[y * srcW + x] =
-                            (ushort)Math.Clamp((int)Math.Round(encoded), 0, 65535);
+                        localZs[y * srcW + x] =
+                            (float)((raw - 32768) * LandscapeZScale * info.ScaleZ);
+                        valid[y * srcW + x] = true;
                     }
                 }
             });
 
-            if (!double.IsInfinity(minH))
-                Log.Information("    '{0}' height range: [{1:F0}, {2:F0}] cm (LocZ={3:F0})",
-                    info.Name, minH, maxH, info.LocZ);
-
-            GetOutputBounds(info, srcW, srcH,
-                HmPixelsPerCm, HmOutputCenter, HmOutputSize,
-                out int dxMin, out int dyMin, out int dxMax, out int dyMax);
-
-            if (dxMin > dxMax || dyMin > dyMax) return;
-
-            dst.ProcessPixelRows(acc =>
-            {
-                for (int dy = dyMin; dy <= dyMax; dy++)
-                {
-                    var outRow = acc.GetRowSpan(dy);
-                    double wyCm = (dy - HmOutputCenter) * HmCmPerPixel;
-
-                    for (int dx = dxMin; dx <= dxMax; dx++)
-                    {
-                        double wxCm = (dx - HmOutputCenter) * HmCmPerPixel;
-
-                        if (!WorldToSourceFrac(info, srcW, srcH, wxCm, wyCm,
-                                out double fracX, out double fracY))
-                            continue;
-
-                        ushort newVal = BilinearSampleU16(srcPixels, srcW, srcH, fracX, fracY);
-
-                        // Keep the highest elevation at each output pixel; skip 0 (no-data sentinel).
-                        if (newVal > 0 && newVal > outRow[dx].PackedValue)
-                            outRow[dx] = new L16(newVal);
-                    }
-                }
-            });
+            info.LocalZCm    = localZs;
+            info.LocalZValid = valid;
+            info.LzW         = srcW;
+            info.LzH         = srcH;
         }
 
-        private static unsafe void BlitWeightmap(LandscapeInfo info, SKBitmap src, SKBitmap dst)
+        // Projects a grid of local heights through the proxy transform. This is the whole
+        // of the geometry: a source texel at local (lx, ly, localZ) lands at
+        //     world = Loc + R * (lx, ly, localZ)
+        // with every term carried, tilt included. There is no inverse to solve and nothing
+        // to iterate, so a pitch/roll tilt is not a special case here - and two surfaces
+        // over one world XY are simply two samples that both land there, which is exactly
+        // what the depth test needs to see.
+        private static Surface BuildSurface(
+            LandscapeInfo info, int w, int h, float[] localZ, bool[] valid, double zOffsetCm)
         {
-            int srcW = src.Width, srcH = src.Height;
+            double qSpanX = info.MaxX - info.MinX;
+            double qSpanY = info.MaxY - info.MinY;
+            double quadsPerPxX = w > 1 ? qSpanX / (w - 1) : 0.0;
+            double quadsPerPxY = h > 1 ? qSpanY / (h - 1) : 0.0;
 
-            var srcArr = new byte[srcW * srcH];
-            byte* sp   = (byte*)src.GetPixels();
-            int srcRB  = src.RowBytes;
-            for (int y = 0; y < srcH; y++)
-                Marshal.Copy((IntPtr)(sp + y * srcRB), srcArr, y * srcW, srcW);
-
-            GetOutputBounds(info, srcW, srcH,
-                WmPixelsPerCm, WmOutputCenter, WmOutputSize,
-                out int dxMin, out int dyMin, out int dxMax, out int dyMax);
-
-            if (dxMin > dxMax || dyMin > dyMax) return;
-
-            byte* dp  = (byte*)dst.GetPixels();
-            int dstRB = dst.RowBytes;
-
-            for (int dy = dyMin; dy <= dyMax; dy++)
+            var surf = new Surface
             {
-                double wyCm  = (dy - WmOutputCenter) * WmCmPerPixel;
-                byte*  dstRow = dp + dy * dstRB;
+                W = w, H = h,
+                Wx = new double[w * h],
+                Wy = new double[w * h],
+                Wz = new double[w * h],
+                Valid = valid,
+            };
 
-                for (int dx = dxMin; dx <= dxMax; dx++)
+            double minZ = double.PositiveInfinity, maxZ = double.NegativeInfinity;
+
+            for (int y = 0; y < h; y++)
+            {
+                double lqy = info.MinY + y * quadsPerPxY;
+                double ly  = (lqy - info.SectionOffsetY) * info.ScaleY;
+
+                double rowX = info.LocX + info.R01 * ly;
+                double rowY = info.LocY + info.R11 * ly;
+                double rowZ = info.LocZ + info.R21 * ly + zOffsetCm;
+
+                for (int x = 0; x < w; x++)
                 {
-                    double wxCm = (dx - WmOutputCenter) * WmCmPerPixel;
+                    int i = y * w + x;
+                    if (!valid[i]) continue;
 
-                    if (!WorldToSourceFrac(info, srcW, srcH, wxCm, wyCm,
-                            out double fracX, out double fracY))
+                    double lqx = info.MinX + x * quadsPerPxX;
+                    double lx  = (lqx - info.SectionOffsetX) * info.ScaleX;
+                    double lz  = localZ[i];
+
+                    surf.Wx[i] = rowX + info.R00 * lx + info.R02 * lz;
+                    surf.Wy[i] = rowY + info.R10 * lx + info.R12 * lz;
+                    surf.Wz[i] = rowZ + info.R20 * lx + info.R22 * lz;
+
+                    if (surf.Wz[i] < minZ) minZ = surf.Wz[i];
+                    if (surf.Wz[i] > maxZ) maxZ = surf.Wz[i];
+                }
+            }
+
+            if (!double.IsInfinity(minZ))
+                Log.Information("    '{0}' height range: [{1:F0}, {2:F0}] cm (LocZ={3:F0})",
+                    info.Name, minZ, maxZ, info.LocZ);
+
+            return surf;
+        }
+
+        // The weightmap grid at its own resolution, riding on the height grid's surface.
+        private static Surface BuildSurfaceFromHeightGrid(
+            LandscapeInfo info, int w, int h, double zOffsetCm)
+        {
+            var hz = info.LocalZCm!;
+            var hv = info.LocalZValid!;
+            int lw = info.LzW, lh = info.LzH;
+
+            var localZ = new float[w * h];
+            var valid  = new bool[w * h];
+
+            for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                // Both grids span the same local quad extent, so position maps by ratio.
+                double fx = w > 1 ? x * (lw - 1.0) / (w - 1.0) : 0.0;
+                double fy = h > 1 ? y * (lh - 1.0) / (h - 1.0) : 0.0;
+
+                int x0 = Math.Clamp((int)fx, 0, lw - 1);
+                int y0 = Math.Clamp((int)fy, 0, lh - 1);
+                int x1 = Math.Min(x0 + 1, lw - 1);
+                int y1 = Math.Min(y0 + 1, lh - 1);
+
+                // A texel is only usable where the whole cell under it has data; blending
+                // through the sentinel would invent a surface that is not there.
+                if (!hv[y0 * lw + x0] || !hv[y0 * lw + x1] ||
+                    !hv[y1 * lw + x0] || !hv[y1 * lw + x1]) continue;
+
+                double tx = fx - x0, ty = fy - y0;
+                localZ[y * w + x] = (float)(
+                    (1 - tx) * (1 - ty) * hz[y0 * lw + x0] +
+                          tx  * (1 - ty) * hz[y0 * lw + x1] +
+                    (1 - tx) *       ty  * hz[y1 * lw + x0] +
+                          tx  *       ty  * hz[y1 * lw + x1]);
+                valid[y * w + x] = true;
+            }
+
+            return BuildSurface(info, w, h, localZ, valid, zOffsetCm);
+        }
+
+        // One triangle of the projected surface, set up in destination-pixel space.
+        private readonly struct Tri
+        {
+            public readonly double X0, Y0, X1, Y1, X2, Y2, InvDet;
+            public readonly int MinX, MinY, MaxX, MaxY;
+            public readonly bool Ok;
+
+            public Tri(double x0, double y0, double x1, double y1, double x2, double y2,
+                       int outputSize)
+            {
+                X0 = x0; Y0 = y0; X1 = x1; Y1 = y1; X2 = x2; Y2 = y2;
+
+                double det = (Y1 - Y2) * (X0 - X2) + (X2 - X1) * (Y0 - Y2);
+                // Degenerate once projected - a sliver seen edge-on contributes nothing,
+                // and its neighbours cover the same ground.
+                if (Math.Abs(det) < 1e-12)
+                {
+                    InvDet = 0; MinX = MinY = 0; MaxX = MaxY = -1; Ok = false;
+                    return;
+                }
+                InvDet = 1.0 / det;
+
+                MinX = (int)Math.Ceiling (Math.Min(x0, Math.Min(x1, x2)));
+                MaxX = (int)Math.Floor   (Math.Max(x0, Math.Max(x1, x2)));
+                MinY = (int)Math.Ceiling (Math.Min(y0, Math.Min(y1, y2)));
+                MaxY = (int)Math.Floor   (Math.Max(y0, Math.Max(y1, y2)));
+
+                if (MinX < 0) MinX = 0;
+                if (MinY < 0) MinY = 0;
+                if (MaxX > outputSize - 1) MaxX = outputSize - 1;
+                if (MaxY > outputSize - 1) MaxY = outputSize - 1;
+
+                Ok = MinX <= MaxX && MinY <= MaxY;
+            }
+
+            // Barycentric weights of a destination pixel centre, or false if outside.
+            public bool Weights(double px, double py, out double b0, out double b1, out double b2)
+            {
+                b0 = ((Y1 - Y2) * (px - X2) + (X2 - X1) * (py - Y2)) * InvDet;
+                b1 = ((Y2 - Y0) * (px - X2) + (X0 - X2) * (py - Y2)) * InvDet;
+                b2 = 1.0 - b0 - b1;
+                return b0 >= 0.0 && b1 >= 0.0 && b2 >= 0.0;
+            }
+        }
+
+        // Walks the source grid cell by cell, splitting each into the two triangles UE
+        // renders it as, and hands them to the caller in destination-pixel space. Triangles
+        // tile the surface, so the projection is gap-free however the proxy is rotated, and
+        // a folded surface simply delivers both of its sheets to the same pixels.
+        private delegate void TriSink(in Tri tri, int i0, int i1, int i2);
+
+        private static void ForEachTriangle(
+            Surface surf, double pixelsPerCm, int outputCenter, int outputSize, TriSink sink)
+        {
+            int w = surf.W, h = surf.H;
+
+            for (int y = 0; y < h - 1; y++)
+            for (int x = 0; x < w - 1; x++)
+            {
+                int a = y * w + x, b = a + 1, c = a + w, d = c + 1;
+                if (!surf.Valid[a] || !surf.Valid[b] ||
+                    !surf.Valid[c] || !surf.Valid[d]) continue;
+
+                double ax = outputCenter + surf.Wx[a] * pixelsPerCm;
+                double ay = outputCenter + surf.Wy[a] * pixelsPerCm;
+                double bx = outputCenter + surf.Wx[b] * pixelsPerCm;
+                double by = outputCenter + surf.Wy[b] * pixelsPerCm;
+                double cx = outputCenter + surf.Wx[c] * pixelsPerCm;
+                double cy = outputCenter + surf.Wy[c] * pixelsPerCm;
+                double dx = outputCenter + surf.Wx[d] * pixelsPerCm;
+                double dy = outputCenter + surf.Wy[d] * pixelsPerCm;
+
+                var t0 = new Tri(ax, ay, bx, by, dx, dy, outputSize);
+                if (t0.Ok) sink(in t0, a, b, d);
+
+                var t1 = new Tri(ax, ay, dx, dy, cx, cy, outputSize);
+                if (t1.Ok) sink(in t1, a, d, c);
+            }
+        }
+
+        private static void ScatterHeights(Surface surf, float[] depth)
+        {
+            var wz = surf.Wz;
+
+            ForEachTriangle(surf, HmPixelsPerCm, HmOutputCenter, HmOutputSize,
+                (in Tri t, int i0, int i1, int i2) =>
+            {
+                double z0 = wz[i0], z1 = wz[i1], z2 = wz[i2];
+
+                for (int py = t.MinY; py <= t.MaxY; py++)
+                for (int px = t.MinX; px <= t.MaxX; px++)
+                {
+                    if (!t.Weights(px, py, out double b0, out double b1, out double b2))
                         continue;
 
-                    byte newVal = BilinearSampleU8(srcArr, srcW, srcH, fracX, fracY);
+                    double z = b0 * z0 + b1 * z1 + b2 * z2;
+                    // Below the output floor this surface is not written at all, and
+                    // nothing lower than it could win the pixel either.
+                    if (z < HeightFloorCm) continue;
 
-                    if (newVal > dstRow[dx])
-                        dstRow[dx] = newVal;
+                    int di = py * HmOutputSize + px;
+                    if (z > depth[di]) depth[di] = (float)z;
+                }
+            });
+        }
+
+        // Every material of one proxy resolved in a single pass: whichever sample is
+        // highest at a pixel wins it outright and writes all of the materials, including a
+        // zero for the ones this proxy does not paint. A lower surface writes nothing, so a
+        // pixel's materials always describe one surface - the visible one - rather than a
+        // mixture of a surface and whatever is buried beneath it.
+        private static unsafe void ScatterLayers(
+            Surface surf, Dictionary<string, byte[]> srcLayers,
+            Dictionary<string, SKBitmap> dsts, float[] depth)
+        {
+            int n = dsts.Count;
+            var dstPtr = new IntPtr[n];
+            var dstRb  = new int[n];
+            var srcArr = new byte[]?[n];
+            {
+                int k = 0;
+                foreach (var (name, bm) in dsts)
+                {
+                    dstPtr[k] = bm.GetPixels();
+                    dstRb[k]  = bm.RowBytes;
+                    srcArr[k] = srcLayers.TryGetValue(name, out var a) ? a : null;
+                    k++;
                 }
             }
-        }
 
-        // fracX/fracY are continuous pixel coordinates in [0, srcW-1] × [0, srcH-1].
-        private static ushort BilinearSampleU16(
-            ushort[] pixels, int srcW, int srcH, double fracX, double fracY)
-        {
-            int x0 = (int)Math.Floor(fracX);
-            int y0 = (int)Math.Floor(fracY);
-            int x1 = Math.Min(x0 + 1, srcW - 1);
-            int y1 = Math.Min(y0 + 1, srcH - 1);
-            x0 = Math.Max(x0, 0);
-            y0 = Math.Max(y0, 0);
+            var wz = surf.Wz;
 
-            double tx = fracX - x0;
-            double ty = fracY - y0;
-
-            double v =
-                (1 - tx) * (1 - ty) * pixels[y0 * srcW + x0] +
-                      tx  * (1 - ty) * pixels[y0 * srcW + x1] +
-                (1 - tx) *       ty  * pixels[y1 * srcW + x0] +
-                      tx  *       ty  * pixels[y1 * srcW + x1];
-
-            return (ushort)Math.Clamp((int)Math.Round(v), 0, 65535);
-        }
-
-        private static byte BilinearSampleU8(
-            byte[] pixels, int srcW, int srcH, double fracX, double fracY)
-        {
-            int x0 = (int)Math.Floor(fracX);
-            int y0 = (int)Math.Floor(fracY);
-            int x1 = Math.Min(x0 + 1, srcW - 1);
-            int y1 = Math.Min(y0 + 1, srcH - 1);
-            x0 = Math.Max(x0, 0);
-            y0 = Math.Max(y0, 0);
-
-            double tx = fracX - x0;
-            double ty = fracY - y0;
-
-            double v =
-                (1 - tx) * (1 - ty) * pixels[y0 * srcW + x0] +
-                      tx  * (1 - ty) * pixels[y0 * srcW + x1] +
-                (1 - tx) *       ty  * pixels[y1 * srcW + x0] +
-                      tx  *       ty  * pixels[y1 * srcW + x1];
-
-            return (byte)Math.Clamp((int)Math.Round(v), 0, 255);
-        }
-
-        // Maps a world-space cm position to a fractional source pixel coordinate.
-        // Returns false when the position falls outside the source image.
-        private static bool WorldToSourceFrac(
-            LandscapeInfo info, int srcW, int srcH,
-            double wxCm, double wyCm,
-            out double fracX, out double fracY)
-        {
-            double dx = wxCm - info.LocX;
-            double dy = wyCm - info.LocY;
-
-            // Inverse rotation (transpose of 2×2 rotation sub-matrix)
-            double lx = info.R00 * dx + info.R10 * dy;
-            double ly = info.R01 * dx + info.R11 * dy;
-
-            double lqx = lx / info.ScaleX + info.SectionOffsetX;
-            double lqy = ly / info.ScaleY + info.SectionOffsetY;
-
-            fracX = (lqx - info.MinX) / (info.MaxX - info.MinX) * (srcW - 1);
-            fracY = (lqy - info.MinY) / (info.MaxY - info.MinY) * (srcH - 1);
-
-            return fracX >= 0.0 && fracX <= srcW - 1 &&
-                   fracY >= 0.0 && fracY <= srcH - 1;
-        }
-
-        // Computes the bounding box in output-pixel space covered by this landscape,
-        // clamped to [0, outputSize-1].
-        private static void GetOutputBounds(
-            LandscapeInfo info, int srcW, int srcH,
-            double pixelsPerCm, int outputCenter, int outputSize,
-            out int dxMin, out int dyMin, out int dxMax, out int dyMax)
-        {
-            int[] cqx = { info.MinX, info.MaxX, info.MinX, info.MaxX };
-            int[] cqy = { info.MinY, info.MinY, info.MaxY, info.MaxY };
-
-            int oMinX = int.MaxValue, oMinY = int.MaxValue;
-            int oMaxX = int.MinValue, oMaxY = int.MinValue;
-
-            for (int i = 0; i < 4; i++)
+            ForEachTriangle(surf, WmPixelsPerCm, WmOutputCenter, WmOutputSize,
+                (in Tri t, int i0, int i1, int i2) =>
             {
-                double lx = (cqx[i] - info.SectionOffsetX) * info.ScaleX;
-                double ly = (cqy[i] - info.SectionOffsetY) * info.ScaleY;
-                double wx = info.LocX + info.R00 * lx + info.R01 * ly;
-                double wy = info.LocY + info.R10 * lx + info.R11 * ly;
+                double z0 = wz[i0], z1 = wz[i1], z2 = wz[i2];
 
-                int ox = (int)Math.Round(outputCenter + wx * pixelsPerCm);
-                int oy = (int)Math.Round(outputCenter + wy * pixelsPerCm);
+                for (int py = t.MinY; py <= t.MaxY; py++)
+                for (int px = t.MinX; px <= t.MaxX; px++)
+                {
+                    if (!t.Weights(px, py, out double b0, out double b1, out double b2))
+                        continue;
 
-                oMinX = Math.Min(oMinX, ox);
-                oMinY = Math.Min(oMinY, oy);
-                oMaxX = Math.Max(oMaxX, ox);
-                oMaxY = Math.Max(oMaxY, oy);
+                    double z  = b0 * z0 + b1 * z1 + b2 * z2;
+                    int    di = py * WmOutputSize + px;
+                    if (z <= depth[di]) continue;
+                    depth[di] = (float)z;
+
+                    for (int k = 0; k < n; k++)
+                    {
+                        var src = srcArr[k];
+                        byte v = 0;
+                        if (src != null)
+                        {
+                            double a = b0 * src[i0] + b1 * src[i1] + b2 * src[i2];
+                            v = (byte)Math.Clamp((int)Math.Round(a), 0, 255);
+                        }
+                        ((byte*)dstPtr[k])[py * dstRb[k] + px] = v;
+                    }
+                }
+            });
+        }
+
+        private static unsafe byte[] CopyGray8(SKBitmap src)
+        {
+            int w = src.Width, h = src.Height;
+            var arr = new byte[w * h];
+            byte* sp = (byte*)src.GetPixels();
+            int rb   = src.RowBytes;
+            for (int y = 0; y < h; y++)
+                Marshal.Copy((IntPtr)(sp + y * rb), arr, y * w, w);
+            return arr;
+        }
+
+        // The depth buffer is the heightmap: encode what survived the depth test.
+        // Stored as output_raw = worldZ + 32768 (32768 = zero height), 0 = no data.
+        private static void EncodeHeights(float[] depth, Image<L16> dst)
+        {
+            dst.ProcessPixelRows(acc =>
+            {
+                for (int y = 0; y < HmOutputSize; y++)
+                {
+                    var row = acc.GetRowSpan(y);
+                    for (int x = 0; x < HmOutputSize; x++)
+                    {
+                        float z = depth[y * HmOutputSize + x];
+                        if (z < NoDepthTest) continue;
+                        row[x] = new L16((ushort)Math.Clamp(
+                            (int)Math.Round(z + 32768.0), 0, 65535));
+                    }
+                }
+            });
+        }
+
+        // UE's visibility mask. It punches holes in the landscape rather than painting it,
+        // so it never takes a share of the layer blend.
+        private const string VisibilityLayer = "DataLayer__";
+
+        // A landscape texel with every weight at zero is not a hole - the game still draws
+        // ground there. Every layer of the Revamp masters is LB_HeightBlend, and
+        // UMaterialExpressionLandscapeLayerBlend::Compile floors each layer's
+        // height-modified weight before dividing the lot through by their sum:
+        //
+        //     w_i = clamp(2*W_i - 1 + H_i, 0.0001, 1),   out = Σ(layer_i * w_i) / Σ(w)
+        //
+        // The height inputs are mask textures in 0..1, so where every painted weight W_i is
+        // zero every layer lands on that same 0.0001 floor and the division hands them back
+        // in equal shares - a component with one allocated layer renders it at full
+        // strength. Only the layers the component actually allocates take part:
+        // FHLSLMaterialTranslator::StaticTerrainLayerWeight compiles the others out of that
+        // component's shader permutation. (The one layer that survives not being allocated
+        // is 'a', the biome's base ground, which carries PreviewWeight 1.0 and so falls back
+        // to a constant weight - but every component allocates it in practice.)
+        //
+        // So the fallback is per component, not global: Callahan's Passage falls back to
+        // 'a', Fisherman's Row to 'c'. Reproduce that in the proxy's vertex grid, which is
+        // the same grid TryConvert lays its weightmaps out on.
+        private static void FillUnpainted(
+            LandscapeInfo info,
+            Dictionary<string, byte[]> srcLayers,
+            Dictionary<string, SKBitmap> weightDsts,
+            int wmW, int wmH)
+        {
+            // Summed over every layer, not just the component's own, so a texel a
+            // neighbour has already painted - the two share a vertex row along their seam -
+            // reads as painted here too. Claimed texels are marked in the same array, which
+            // hands a contested seam to whichever component reaches it first.
+            var claimed = new int[wmW * wmH];
+            foreach (var (_, arr) in srcLayers)
+                for (int i = 0; i < claimed.Length; i++)
+                    claimed[i] += arr[i];
+
+            long filled = 0;
+            var physNames = new List<string>();
+
+            foreach (var comp in info.Components)
+            {
+                physNames.Clear();
+
+                foreach (var alloc in comp.WeightmapLayerAllocations)
+                {
+                    string raw = alloc.GetLayerName();
+                    if (raw.Equals("NormalMap_DX", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    if (!info.LayerToPhys.TryGetValue(raw, out var phys)) phys = raw;
+                    if (phys.Equals(VisibilityLayer, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!weightDsts.ContainsKey(phys)) continue;
+
+                    // Several raw layers of one component can resolve to a single physical
+                    // material. The game averages them, which - their inputs being the same
+                    // material - comes to that material at full strength, so counting the
+                    // material once is what reproduces it.
+                    if (!physNames.Contains(phys, StringComparer.OrdinalIgnoreCase))
+                        physNames.Add(phys);
+                }
+
+                if (physNames.Count == 0) continue;
+
+                byte share = (byte)Math.Clamp((int)Math.Round(255.0 / physNames.Count), 1, 255);
+
+                var arrays = new byte[physNames.Count][];
+                for (int k = 0; k < physNames.Count; k++)
+                {
+                    if (!srcLayers.TryGetValue(physNames[k], out var arr))
+                    {
+                        // Allocated but zero across the whole proxy, so TryConvert never
+                        // made it a bitmap. It still takes its share of the fallback.
+                        arr = new byte[wmW * wmH];
+                        srcLayers[physNames[k]] = arr;
+                    }
+                    arrays[k] = arr;
+                }
+
+                int x0   = comp.SectionBaseX - info.MinX;
+                int y0   = comp.SectionBaseY - info.MinY;
+                int span = comp.ComponentSizeQuads + 1;
+
+                for (int y = y0; y < y0 + span; y++)
+                {
+                    if ((uint)y >= (uint)wmH) continue;
+                    int row = y * wmW;
+
+                    for (int x = x0; x < x0 + span; x++)
+                    {
+                        if ((uint)x >= (uint)wmW) continue;
+
+                        int i = row + x;
+                        if (claimed[i] != 0) continue;
+
+                        foreach (var arr in arrays) arr[i] = share;
+                        claimed[i] = share;
+                        filled++;
+                    }
+                }
             }
 
-            // 1-pixel margin to avoid border gaps from rounding
-            dxMin = Math.Max(0,              oMinX - 1);
-            dyMin = Math.Max(0,              oMinY - 1);
-            dxMax = Math.Min(outputSize - 1, oMaxX + 1);
-            dyMax = Math.Min(outputSize - 1, oMaxY + 1);
+            if (filled > 0)
+                Log.Information(
+                    "    Unpainted texels: {0} of {1} filled from their component's layers.",
+                    filled, (long)wmW * wmH);
         }
 
         private static string ResolvePhysName(FWeightmapLayerAllocationInfo alloc)
