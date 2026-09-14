@@ -52,7 +52,6 @@ from utils.config import (
     SPLINE_LAYER_TERRAIN_DROP,
     SPLIT_LAYERS,
     SPLIT_LAYERS_DIR,
-    SVG_LAYERS,
     SVG_LAYERS_DIR,
     TERRAIN_CULL_MIN_Z,
     TERRAIN_SPLINE_CATS,
@@ -71,28 +70,38 @@ from utils.bake import (
 )
 from utils import progress, tui
 from utils.parallel import run_parallel_subprocesses
-from utils.svg_render import render_bridges_aim_layer, render_svg_layers
+from utils.svg_render import (
+    SVG_FILE_LAYERS,
+    render_bridges_aim_layer,
+    render_svg_layers,
+)
 
 
-def _load_region_water_dist(region_name: str) -> Optional[np.ndarray]:
-    """Distance-to-shore field (float32, 0 on non-water) from the per-region
-    water ID coverage PNG, or None when it's not on disk yet.
+def _load_region_water_fields(
+    region_name: str,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """(distance-to-shore field, raw water coverage mask) for one region, or
+    (None, None) when the water ID PNG isn't on disk yet.
 
-    A pixel counts as water when its coverage is at least
-    BRIDGES_AIM_WATER_THRESH AND, when the region's landscape/water
-    heightmap bakes are present, it is submerged by at least
-    BRIDGES_AIM_MIN_DEPTH_M metres (freighters ground in shallower water).
-    Bridge decks read as non-water in the water bake (they occlude the
-    surface), so aim lines stop before crossing another bridge. The
-    distance transform lets the aim tracer steer toward the more open
-    side of the channel."""
+    Two different questions need two different masks. The distance field is
+    built from *navigable* water -- coverage at least BRIDGES_AIM_WATER_THRESH
+    and, when the heightmap bakes are present, submerged by at least
+    BRIDGES_AIM_MIN_DEPTH_M metres, since freighters ground in shallower
+    water -- and it is what the aim lines are routed through. The raw
+    coverage mask keeps the depth gate out of it, and answers only "is this
+    water rather than land"; a shallow passage no freighter could use is
+    still water, and a line drawn along it crosses no terrain.
+
+    Bridge decks read as non-water in both (they occlude the surface), so aim
+    lines stop before crossing another bridge."""
     water_path = ID_DIR / "water" / f"{region_name}.png"
     if not water_path.is_file():
-        return None
+        return None, None
     wc = cv2.imread(str(water_path), cv2.IMREAD_GRAYSCALE)
     if wc is None:
-        return None
-    water = wc >= BRIDGES_AIM_WATER_THRESH
+        return None, None
+    raw_water = wc >= BRIDGES_AIM_WATER_THRESH
+    water = raw_water.copy()
     if BRIDGES_AIM_MIN_DEPTH_M > 0:
         hl = cv2.imread(
             str(HM_LANDSCAPE_DIR / f"{region_name}.png"), cv2.IMREAD_UNCHANGED)
@@ -106,7 +115,27 @@ def _load_region_water_dist(region_name: str) -> Optional[np.ndarray]:
             deep = depth_cm >= int(round(BRIDGES_AIM_MIN_DEPTH_M * 100))
             water &= (hl != 0) & (hw != 0) & deep
     water = water.astype(np.uint8) * 255
-    return cv2.distanceTransform(water, cv2.DIST_L2, 3)
+    return cv2.distanceTransform(water, cv2.DIST_L2, 3), raw_water
+
+
+def _render_bridges_aim(region_name: str) -> bool:
+    """Render the procedural bridges_aim layer for one region.
+
+    Split out of render_one() because it has two callers: the full bake
+    path, where it runs last so it can read the water ID coverage this run
+    just baked, and the SVG-only path, which returns before Blender is ever
+    opened. It needs no Blender state -- only the region JSON and whatever
+    water bake is already on disk -- so the early return must not skip it.
+    """
+    water_dist, water_mask = _load_region_water_fields(region_name)
+    if water_dist is None:
+        print("  [bridges_aim] no water ID PNG; "
+              "aim lines drawn at full length (no steering/cut)")
+    try:
+        return render_bridges_aim_layer(region_name, water_dist, water_mask)
+    except Exception as exc:
+        print(f"  [WARN] bridges_aim render failed: {exc}")
+        return False
 
 
 def _collect_focus_terrain_objects(region_name: str) -> list:
@@ -269,7 +298,11 @@ def render_one(
     needs_blend = (do_ao or do_hm or do_id or do_roads or do_beaches
                    or do_split_layers)
     if not needs_blend:
-        # SVG-only run: skip the multi-GB scene load.
+        # SVG-only run: skip the multi-GB scene load, but bridges_aim is
+        # still one of this run's expected outputs -- it is procedural, not
+        # a bake, so it does not need the .blend.
+        if do_svg and not _render_bridges_aim(region_name):
+            ok = False
         return ok
 
     bpy.ops.wm.open_mainfile(filepath=str(blend_path))
@@ -644,18 +677,10 @@ def render_one(
                 ok = False
 
     if do_svg:
-        # bridges_aim is rendered procedurally here (not by render_svg_layers)
-        # so it can snap nearby bridges into curves and truncate straight
-        # aim lines at the shoreline using this region's land mask.
-        water_dist = _load_region_water_dist(region_name)
-        if water_dist is None:
-            print("  [bridges_aim] no water ID PNG; "
-                  "aim lines drawn at full length (no steering/cut)")
-        try:
-            if not render_bridges_aim_layer(region_name, water_dist):
-                ok = False
-        except Exception as exc:
-            print(f"  [WARN] bridges_aim render failed: {exc}")
+        # Rendered last (not by render_svg_layers) so it can snap nearby
+        # bridges into curves and route the aim lines through the water ID
+        # coverage this run just baked.
+        if not _render_bridges_aim(region_name):
             ok = False
 
     return ok
@@ -679,7 +704,7 @@ def _output_candidates(region: str, flags: Flags) -> List[Path]:
     out: List[Path] = []
     if svg:
         out.extend(SVG_LAYERS_DIR / layer / f"{region}.png"
-                   for layer in SVG_LAYERS)
+                   for layer in SVG_FILE_LAYERS)
         out.append(BRIDGES_AIM_DIR / f"{region}.png")
     if ao:
         out.append(AO_DIR / f"{region}.png")
@@ -710,7 +735,7 @@ def _expected_outputs(flags: Flags) -> int:
     """Total the bar is sized for: every file a region could write."""
     svg, ao, hm, ids, roads, beaches, split = flags
     return (
-        (len(SVG_LAYERS) + 1) * svg
+        (len(SVG_FILE_LAYERS) + 1) * svg
         + 1 * ao
         + 2 * hm
         + ID_FILES_MAX * ids

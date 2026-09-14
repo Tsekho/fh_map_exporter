@@ -129,6 +129,98 @@ HM_SPLIT_M = 20.0
 FLY_ALERT_MIN_M = 95.0
 FLY_ALERT_MAX_M = 100.0
 
+
+# ------------------------------------------------------------------------------
+#  Per-region Z normalisation (mirror of Exporter/Constants.cs)
+# ------------------------------------------------------------------------------
+
+# Z offset (cm) that Exporter.exe ADDS to every exported height and every JSON Z
+# when it writes a region, so neighbouring regions meet seamlessly at the hex
+# borders. Everything downstream of step 1 therefore carries it.
+#
+# DUPLICATED from Exporter/Constants.cs :: HeightOffsets. The C# side owns these
+# values; this copy exists only so the Python stages can undo the shift. Edit
+# both or neither - assert_height_offsets_match() in this module checks them.
+#
+# Why anything would undo it: the in-game altimeter reads the aircraft's raw
+# world Z (the shipping exe feeds RootComponent's world-location Z straight into
+# its Altitude* curves - no datum actor, no ground trace), and the game knows
+# nothing about this normalisation. So an exported height is
+# `raw world Z + offset`, and a stage comparing against an in-game altitude has
+# to subtract the region's offset first. Only absolute-altitude consumers care
+# (fly_alert); anything measuring a difference of two heights cancels it out.
+#
+# Keys are lower-cased region names as they appear in the asset path.
+HEIGHT_OFFSETS_CM: Dict[str, float] = {
+    "shackledchasmhex":    50,
+    "clahstrahex":         42,
+    "drownedvalehex":      40,
+    "endlessshorehex":     50,
+    "reaverspasshex":      42,
+    "sableporthex":        50,
+    "mooringcountyhex":    30,
+    "stonecradlehex":      50,
+    "weatheredexpansehex": 50,
+    "stlicanshelfhex":     42,
+    "tempestislandhex":    50,
+    "wrestahex":           50,
+    "farranaccoasthex":    50,
+    "gutterhex":           50,
+    "kingscagehex":        50,
+    "westgatehex":         50,
+    "fishermansrowhex":    50,
+    "palantinebermhex":    50,
+    "stemalandinghex":     42,
+    "oarbreakerhex":       70,
+    "lykosislehex":        50,
+    "kuurastrandhex":      50,
+    "paripeakhex":         50,
+    "thefingershex":       50,
+    "olaviswakehex":       50,
+    "onyxhex":             50,
+    "tyrantfoothillshex":  50,
+    "pipersenclavehex":    50,
+    "homeregionc":         450,
+    "homeregionw":         450,
+}
+
+
+def height_offset_cm(region: str) -> float:
+    """Z offset (cm) Exporter.exe added to ``region``, or 0.0 if it added none."""
+    return HEIGHT_OFFSETS_CM.get(region.lower(), 0.0)
+
+
+def assert_height_offsets_match() -> None:
+    """Raise if HEIGHT_OFFSETS_CM has drifted from Exporter/Constants.cs.
+
+    Cheap guard against the two copies diverging; the C# file is the source of
+    truth. Silently returns when the C# source isn't present (release checkouts
+    ship Exporter.exe without it).
+    """
+    import re
+
+    cs = EXPORTER_PROJECT_DIR / "Constants.cs"
+    if not cs.is_file():
+        return
+    text = cs.read_text(encoding="utf-8")
+    try:
+        block = text.split("HeightOffsets =")[1].split("};")[0]
+    except IndexError:
+        return
+    theirs = {m.group(1).lower(): float(m.group(2))
+              for m in re.finditer(r'\["([^"]+)"\]\s*=\s*([-\d.]+)', block)}
+    ours = {k.lower(): float(v) for k, v in HEIGHT_OFFSETS_CM.items()}
+    if theirs != ours:
+        only_cs = sorted(set(theirs) - set(ours))
+        only_py = sorted(set(ours) - set(theirs))
+        differ = sorted(k for k in set(theirs) & set(ours)
+                        if theirs[k] != ours[k])
+        raise ValueError(
+            "HEIGHT_OFFSETS_CM is out of sync with Exporter/Constants.cs "
+            f"(only in Constants.cs: {only_cs}; only in config.py: {only_py}; "
+            f"different values: {[(k, theirs[k], ours[k]) for k in differ]})"
+        )
+
 # Gaussian blur applied to shades.png in 5_finalize_exports.py as the last
 # step before masking with the terrain coverage alpha. Kernel must be odd.
 # Set SHADES_BLUR_KSIZE = 0 to disable the blur.
@@ -557,6 +649,60 @@ BRIDGES_AIM_FACE_MIN_DOT = 0.7
 #                        the far end of the other bridge's deck -- the U-shape
 #                        that crosses back over it. Past this ratio the route
 #                        is rejected in favour of a short, direct connector.
+#   RELAX_CLEARANCE_PX   fallback clearances (px, descending) retried when a
+#                        route fails at MIN_CLEARANCE_PX. Real channels pinch
+#                        below the nominal ship radius -- under a bridge, in a
+#                        narrow cut -- and a route hugging a slightly tighter
+#                        band is still on water, whereas the unrouted direct
+#                        connector is a straight line drawn over whatever lies
+#                        between the two gaps. Relaxing beats not routing.
+#   RELAXED_MAX_BOW_PX / RELAXED_MAX_BOW_FRAC
+#                        a route that exists only at a relaxed clearance is
+#                        rejected when it bows off the straight gap-to-gap
+#                        chord by more than both of these (absolute px and
+#                        fraction of the span) AND a direct connector would
+#                        lie on water. Scraping through the last marginal
+#                        pockets of an almost-empty navigable mask can find a
+#                        path that detours wildly around nothing -- an L or a
+#                        hook between two bridges that plainly face each
+#                        other. Where the straight line is on water it is the
+#                        better drawing. Both thresholds must trip: the
+#                        fraction alone fires on near-zero spans, where a
+#                        sub-pixel bow is a large ratio and means nothing.
+#                        A full-clearance route is always trusted, however it
+#                        bends -- that bend is a real channel.
+#   DIRECT_MAX_SPAN_PX   last resort, when no clearance yields a route: a
+#                        straight/bezier connector is drawn between two gaps
+#                        only if they are at most this far apart (near-
+#                        coincident placements of one crossing, where the
+#                        connector hides under the decks) or the connector is
+#                        verified to stay on water. Longer unverifiable spans
+#                        draw nothing rather than a line across terrain.
+#   ENTRY_MAX_ANGLE_DEG  hard cap on the angle between a socket's axis and the
+#                        direction to its water entry cell. A ship leaves a
+#                        bridge along the passage, so a line that exits the
+#                        deck sideways is wrong however close the water is;
+#                        past this angle the socket is left undrawn.
+#   LEAD_IN_PX           straight run (px) along the socket axis before the
+#                        route is allowed to bend. Control points inside this
+#                        radius are dropped and an on-axis point is inserted,
+#                        so the curve leaves the bridge on the passage axis
+#                        instead of turning immediately off the deck.
+#   LEAD_IN_MIN_DEV_DEG  the lead-in engages only when the route's natural
+#                        departure is at least this far off the passage axis.
+#                        Two bridges facing each other are rarely exactly
+#                        collinear, and forcing a straight run out of each
+#                        slightly-off axis bends the line one way and then
+#                        the other -- an S across what should be a smooth
+#                        link. Below this tolerance the departure is already
+#                        plausible (ENTRY_MAX_ANGLE_DEG bounds it), so the
+#                        curve is left smooth and nothing is inserted.
+#   LEAD_IN_MAX_SPAN_FRAC
+#                        cap on the lead-in as a fraction of the route it is
+#                        attached to. A fixed LEAD_IN_PX is a small nudge on
+#                        a long channel but most of a short bridge-to-bridge
+#                        connector, where it leaves no room to blend back and
+#                        turns a correction into a kink.
 BRIDGES_AIM_WATER_THRESH = 200
 BRIDGES_AIM_MIN_DEPTH_M = 4.0
 BRIDGES_AIM_MIN_CLEARANCE_PX = 10.0
@@ -570,3 +716,11 @@ BRIDGES_AIM_LATERAL_BIAS = 1.5
 BRIDGES_AIM_END_DEPTH_BIAS = 1.0
 BRIDGES_AIM_END_TRIM_PX = 25.0
 BRIDGES_AIM_PAIR_MAX_DETOUR = 1.6
+BRIDGES_AIM_RELAX_CLEARANCE_PX = (8.0, 6.0, 4.0, 2.0)
+BRIDGES_AIM_DIRECT_MAX_SPAN_PX = 15.0
+BRIDGES_AIM_RELAXED_MAX_BOW_PX = 4.0
+BRIDGES_AIM_RELAXED_MAX_BOW_FRAC = 0.25
+BRIDGES_AIM_ENTRY_MAX_ANGLE_DEG = 35.0
+BRIDGES_AIM_LEAD_IN_PX = 12.0
+BRIDGES_AIM_LEAD_IN_MIN_DEV_DEG = 25.0
+BRIDGES_AIM_LEAD_IN_MAX_SPAN_FRAC = 0.25

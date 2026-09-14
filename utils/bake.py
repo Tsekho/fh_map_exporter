@@ -28,7 +28,9 @@ from utils.config import (
     short_path,
 )
 from utils.gpu_lock import gpu_slot
-from utils.png import write_png16_gray, write_png8_gray, write_png8_rgb, write_png8_rgba
+from utils.png import (atomic_png, imwrite_atomic, partial_path,
+                       unlink_quiet, write_png16_gray, write_png8_gray,
+                       write_png8_rgb, write_png8_rgba)
 
 
 BAKE_IMG_SIZE = 2048
@@ -1151,7 +1153,7 @@ def _clip_near_white(path: str, cutoff: int) -> None:
         rgb = img[..., :3]
         hit = (rgb >= cutoff).any(axis=2)
         rgb[hit] = 255
-    cv2.imwrite(path, img)
+    imwrite_atomic(path, img)
 
 
 def _apply_mask_to_image_file(path: str, mask: np.ndarray,
@@ -1178,10 +1180,13 @@ def _apply_mask_to_image_file(path: str, mask: np.ndarray,
     else:
         px[..., 3] = 1.0
     img.pixels = px.ravel().tolist()
-    img.filepath_raw = path
     img.file_format = 'PNG'
-    img.save()
-    bpy.data.images.remove(img)
+    try:
+        with atomic_png(path) as tmp:
+            img.filepath_raw = tmp
+            img.save()
+    finally:
+        bpy.data.images.remove(img)
 
 
 _GPU_CONFIGURED = False
@@ -1400,7 +1405,13 @@ def render_ao(
     scene.render.image_settings.color_depth = '8'
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    scene.render.filepath = output_path
+    # Render and both post-passes land on the temp; output_path only ever
+    # appears (whole) at the closing rename. The scope is deliberately wide:
+    # a Ctrl+C anywhere from the first Cycles sample to the last post-pass
+    # must not leave a half-written AO bake under the real name.
+    tmp_out = partial_path(output_path)
+    unlink_quiet(tmp_out)  # drop a leftover from an earlier kill
+    scene.render.filepath = tmp_out
     with gpu_slot("AO"):
         bpy.ops.render.render(write_still=True)
 
@@ -1437,8 +1448,13 @@ def render_ao(
     bpy.data.cameras.remove(cam_data)
     bpy.data.materials.remove(ao_mat)
 
-    _apply_mask_to_image_file(output_path, mask)
-    _clip_near_white(output_path, AO_NEAR_WHITE_CUTOFF)
+    try:
+        _apply_mask_to_image_file(tmp_out, mask)
+        _clip_near_white(tmp_out, AO_NEAR_WHITE_CUTOFF)
+        os.replace(tmp_out, output_path)
+    except BaseException:
+        unlink_quiet(tmp_out)
+        raise
     print(f"  AO saved -> {short_path(output_path)}")
 
 
@@ -1778,6 +1794,11 @@ def render_split_layers_ao(
             # Un-hide just this layer's targets for the render.
             _set_hide_bulk(layer_target_objs, False, "hide_render")
 
+            # Cycles output and the mask pass both land on the temp; the
+            # real name appears only once the layer is complete.
+            tmp_out = partial_path(output_path)
+            unlink_quiet(tmp_out)
+
             try:
                 # Rasterise once at margin 0; the margin-16 version the
                 # render border needs is a cheap dilation of it, and the
@@ -1791,7 +1812,7 @@ def render_split_layers_ao(
                 ) > 0
                 if not footprint.any():
                     blank = np.zeros((size, size, 4), dtype=np.uint8)
-                    write_png8_rgba(output_path, blank)
+                    write_png8_rgba(tmp_out, blank)
                     print(f"  [split-layer] empty footprint; wrote blank "
                           f"-> {short_path(output_path)}")
                 else:
@@ -1843,7 +1864,7 @@ def render_split_layers_ao(
                             edge_tex_node.image = None
 
                     try:
-                        scene.render.filepath = output_path
+                        scene.render.filepath = tmp_out
                         with gpu_slot("split-layer"):
                             bpy.ops.render.render(write_still=True)
                     finally:
@@ -1863,7 +1884,12 @@ def render_split_layers_ao(
                 except ReferenceError:
                     pass
 
-            _apply_mask_to_image_file(output_path, mask, preserve_alpha=True)
+            try:
+                _apply_mask_to_image_file(tmp_out, mask, preserve_alpha=True)
+                os.replace(tmp_out, output_path)
+            except BaseException:
+                unlink_quiet(tmp_out)
+                raise
     finally:
         nn = time()
         print(f"  [split-layers] all renders in {nn - nnn:.2f}s")

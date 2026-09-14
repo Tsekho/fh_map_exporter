@@ -23,6 +23,7 @@ import numpy as np
 
 from utils import tui
 from utils.config import CENTRES_FILE, JSON_DIR, MASK_FILE, TILE_SIZE
+from utils.png import imwrite_atomic
 
 
 # Trim amount (per side, in pixels) applied after optional downscale.
@@ -203,16 +204,25 @@ def main() -> int:
     )
     print(f"    output: {out_dir}")
 
+    failed: List[str] = []
     with tui.Progress("Breaking tiles", unit="tile", step_unit="tile") as bar:
         bar.start("tiles", src_path.stem, total)
         for name, (cx, cy) in centres.items():
             tile = _extract_tile(src, cx, cy)
             tile = _apply_mask(tile, mask)
             tile = _finalize(tile, one_k)
-            cv2.imwrite(str(out_dir / f"{name}.png"), tile)
+            try:
+                imwrite_atomic(str(out_dir / f"{name}.png"), tile)
+            except OSError as exc:
+                bar.log(f"  [WARN] {name}: {exc}")
+                failed.append(name)
             bar.update("tiles", advance=1, status=name)
-        bar.finish("tiles")
+        bar.finish("tiles", not failed,
+                   note=f"{len(failed)} failed" if failed else "")
 
+    if failed:
+        print(f"\n{len(failed)} tile(s) not written: {', '.join(failed)}")
+        return 1
     print("=== SUCCESS ===")
     return 0
 

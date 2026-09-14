@@ -645,6 +645,11 @@ class _Task:
         return (self.ended or time.monotonic()) - self.started
 
 
+# Label column bounds for a Progress block (visible characters).
+_LABEL_W_MIN = 8
+_LABEL_W_MAX = 24
+
+
 def _fmt_secs(seconds: float) -> str:
     s = int(seconds)
     if s >= 3600:
@@ -662,7 +667,7 @@ class Progress:
 
     def __init__(self, title: str, total: int = 0, unit: str = "item",
                  step_unit: str = "step", refresh: float = 0.15,
-                 stream=None) -> None:
+                 stream=None, label_width: int = 0) -> None:
         self.title = title
         self.total = total
         self.unit = unit
@@ -684,6 +689,14 @@ class Progress:
         self._closed = False
         self._refresh = refresh
         self._ticker: Optional[threading.Thread] = None
+        # Column widths only ever grow, per block. Sizing them to the tasks
+        # that happen to be live makes the whole bar block slide sideways
+        # every time one starts or finishes; a high-water mark lets the
+        # layout settle after the first few tasks and then stay put.
+        # Callers that know every label up front pass label_width, so the
+        # column is right from the first frame instead of widening once.
+        self._label_w = max(_LABEL_W_MIN, min(_LABEL_W_MAX, label_width))
+        self._count_w = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -754,6 +767,7 @@ class Progress:
         with self._lock:
             self._tasks[key] = _Task(key, label, total)
             self._order.append(key)
+            self._grow_columns(self._tasks[key])
             if not self._live:
                 print(f"  [start] {label}", file=self._out, flush=True)
             else:
@@ -829,6 +843,17 @@ class Progress:
 
     # -- rendering ---------------------------------------------------------
 
+    def _counts(self, done: int, total: int) -> str:
+        """``done/total`` in a column that never changes width: ``done`` is
+        padded to ``total``'s digits, the field to the block's high-water."""
+        return f"{done:>{len(str(total))}}/{total}".rjust(self._count_w)
+
+    def _grow_columns(self, task: "_Task") -> None:
+        self._label_w = max(self._label_w,
+                            min(_LABEL_W_MAX, len(task.label)))
+        self._count_w = max(self._count_w,
+                            len(f"{task.total}/{task.total}"))
+
     def _bar(self, frac: float, width: int, color=None) -> str:
         filled = int(round(frac * width))
         full, empty = _glyph("█", "#"), _glyph("░", ".")
@@ -839,10 +864,15 @@ class Progress:
         if not self._live:
             return
         width = _term_width() - 1
-        label_w = min(24, max(
-            [8] + [len(t.label) for t in self._tasks.values()]))
-        # label + bar + "  100%  1234/1234  " + status
-        bar_w = max(10, min(34, width - label_w - 34))
+        for task in list(self._tasks.values()):
+            # update() can push total past its prediction; widen for it.
+            self._grow_columns(task)
+        if self.total:
+            self._count_w = max(self._count_w,
+                                len(f"{self.total}/{self.total}"))
+        label_w = self._label_w
+        # "  " + label + " " + bar + " 100% " + counts + "  " + status
+        bar_w = max(10, min(34, width - label_w - self._count_w - 12))
 
         lines = []
         header = f"{_bold(_cyan(self.title))}"
@@ -859,7 +889,7 @@ class Progress:
             label = task.label[:label_w].ljust(label_w)
             pct = f"{int(task.frac * 100):>3}%"
             line = (f"  {_cyan(label)} {self._bar(task.frac, bar_w)} "
-                    f"{_bold(pct)} {_grey(f'{task.done}/{task.total}')}")
+                    f"{_bold(pct)} {_grey(self._counts(task.done, task.total))}")
             if task.status:
                 line += _grey(f"  {task.status}")
             lines.append(line)
@@ -871,7 +901,7 @@ class Progress:
                 f"  {_yellow(label)} "
                 f"{self._bar(frac, bar_w, _yellow)} "
                 f"{_bold(f'{int(frac * 100):>3}%')} "
-                f"{_grey(f'{self._finished}/{self.total}')}")
+                f"{_grey(self._counts(self._finished, self.total))}")
         self._frame.draw(lines)
 
 

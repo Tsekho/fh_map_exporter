@@ -204,7 +204,8 @@ def _run_with_progress(
     failed: List[str] = []
 
     with tui.Progress(title, total=len(items), unit=unit,
-                      step_unit=step_unit) as disp:
+                      step_unit=step_unit,
+                      label_width=progress.max_label_width(items, label_fn)) as disp:
         with progress.Poller(disp, tracker) as poller:
 
             def _launch(item: str) -> None:

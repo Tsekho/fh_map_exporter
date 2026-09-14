@@ -32,6 +32,7 @@ __all__ = [
     "PhaseTracker",
     "Tracker",
     "is_noteworthy",
+    "max_label_width",
     "run_serial",
     "capture_output",
     "console_stream",
@@ -68,6 +69,13 @@ def announce_credit(count: int) -> None:
     so the bar can credit them instead of stalling short of full."""
     if count > 0:
         print(f"{CREDIT_PREFIX}{count}", flush=True)
+
+
+def max_label_width(items: Sequence[Any],
+                    label_fn: Callable[[Any], str]) -> int:
+    """Widest label the run will show, so tui.Progress can size its label
+    column once instead of widening it as tasks start."""
+    return max((len(label_fn(item)) for item in items), default=0)
 
 
 def is_noteworthy(line: str) -> bool:
@@ -430,7 +438,8 @@ def run_serial(
     # Survives both the sys.stdout swap and the fd-level capture below.
     console = console_stream()
     with tui.Progress(title, total=len(items), unit=unit,
-                      step_unit=step_unit, stream=console) as disp:
+                      step_unit=step_unit, stream=console,
+                      label_width=max_label_width(items, label_fn)) as disp:
         with Poller(disp, tracker) as poller:
             for item in items:
                 label = label_fn(item)
