@@ -439,10 +439,15 @@ def build_heightmap_simple(
     raw_water: np.ndarray,
     world_alpha: np.ndarray,
     out_path: Path,
+    offset_m: np.ndarray | None = None,
 ) -> None:
     print("  building heightmap_simple...")
     void = raw_water == 0
     meters = (raw_water.astype(np.float32) - 32768.0) / 100.0
+    # The 60 + 2*m ramp is an absolute-altitude scale, so it has to sit on the
+    # raw world Z the game reads. Undo the per-region seam normalisation first.
+    if offset_m is not None:
+        meters -= offset_m
     simple = np.clip(np.round(60.0 + meters * 2.0), 0, 255).astype(np.uint8)
     simple[void] = 0
     _write_with_alpha(simple, world_alpha, out_path)
@@ -1130,7 +1135,8 @@ def _run_heightmap_simple(ctx: Ctx) -> None:
     if ctx.raw_water is None:
         return
     build_heightmap_simple(ctx.raw_water, ctx.world_alpha,
-                           _final(f"{TECHNICAL_DIR}/heightmap_simple.png"))
+                           _final(f"{TECHNICAL_DIR}/heightmap_simple.png"),
+                           ctx.height_offset_m)
 
 
 def _run_dive_alert(ctx: Ctx) -> None:
@@ -1233,7 +1239,7 @@ STAGES: List[Stage] = [
           _run_heightmap_simple,
           lambda: [_final(f"{TECHNICAL_DIR}/heightmap_simple.png")],
           lambda: [HM_WATER_DIR],
-          needs=("raw_water", "world_alpha")),
+          needs=("raw_water", "world_alpha", "height_offset_m")),
     Stage("dive_alert", "assembly/dive_alert.png", _run_dive_alert,
           lambda: [_final(f"{ASSEMBLY_DIR}/dive_alert.png")],
           lambda: [HM_LANDSCAPE_DIR, HM_WATER_DIR, ID_DIR / "water"],
