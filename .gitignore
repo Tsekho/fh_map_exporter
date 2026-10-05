@@ -7,11 +7,9 @@ __*
 *.csproj.lscache
 
 /export/*
-!/export/_final/
 !/export/_extra/
 !/export/hashes.txt
 !/export/h.py
 
 /utils/svg/ladders
-/export/_final/svg_layers/ladders.png
 /assembly/
