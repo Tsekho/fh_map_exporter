@@ -26,6 +26,19 @@ from utils.config import REPO_ROOT
 _PRINT_LOCK = threading.Lock()
 
 
+def _stop(procs) -> None:
+    """Terminate still-running workers (Ctrl+C reaches them too, but a
+    worker deep in a bake can take its time) and reap them."""
+    for proc in procs:
+        if proc.poll() is None:
+            proc.terminate()
+    for proc in procs:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 # Match any absolute path that starts with REPO_ROOT (both "\" and "/"
 # separators, case-insensitive on Windows) and rewrite it to a repo-
 # relative POSIX path so Blender's own log lines (e.g.
@@ -152,24 +165,28 @@ def run_parallel_subprocesses(
         thread.start()
         active[proc] = (item, thread, label)
 
-    while pending and len(active) < workers:
-        _launch(pending.pop(0))
+    try:
+        while pending and len(active) < workers:
+            _launch(pending.pop(0))
 
-    while active:
-        finished = [p for p in active if p.poll() is not None]
-        for proc in finished:
-            item, thread, label = active.pop(proc)
-            thread.join(timeout=5)
-            rc = proc.returncode
-            with _PRINT_LOCK:
-                status = "OK" if rc == 0 else f"FAILED (rc={rc})"
-                print(f"[{label}] done: {status}", flush=True)
-            if rc != 0:
-                failed.append(item)
-            if pending:
-                _launch(pending.pop(0))
-        if not finished:
-            time.sleep(0.05)
+        while active:
+            finished = [p for p in active if p.poll() is not None]
+            for proc in finished:
+                item, thread, label = active.pop(proc)
+                thread.join(timeout=5)
+                rc = proc.returncode
+                with _PRINT_LOCK:
+                    status = "OK" if rc == 0 else f"FAILED (rc={rc})"
+                    print(f"[{label}] done: {status}", flush=True)
+                if rc != 0:
+                    failed.append(item)
+                if pending:
+                    _launch(pending.pop(0))
+            if not finished:
+                time.sleep(0.05)
+    except KeyboardInterrupt:
+        _stop(list(active))
+        raise
 
     return failed
 
@@ -230,22 +247,26 @@ def _run_with_progress(
                 thread.start()
                 active[proc] = (item, thread)
 
-            while pending and len(active) < workers:
-                _launch(pending.pop(0))
+            try:
+                while pending and len(active) < workers:
+                    _launch(pending.pop(0))
 
-            while active:
-                finished = [p for p in active if p.poll() is not None]
-                for proc in finished:
-                    item, thread = active.pop(proc)
-                    thread.join(timeout=5)
-                    poller.remove(item)
-                    rc = proc.returncode
-                    if rc != 0:
-                        failed.append(item)
-                    disp.finish(item, rc == 0, note=f"exit code {rc}")
-                    if pending:
-                        _launch(pending.pop(0))
-                if not finished:
-                    time.sleep(0.05)
+                while active:
+                    finished = [p for p in active if p.poll() is not None]
+                    for proc in finished:
+                        item, thread = active.pop(proc)
+                        thread.join(timeout=5)
+                        poller.remove(item)
+                        rc = proc.returncode
+                        if rc != 0:
+                            failed.append(item)
+                        disp.finish(item, rc == 0, note=f"exit code {rc}")
+                        if pending:
+                            _launch(pending.pop(0))
+                    if not finished:
+                        time.sleep(0.05)
+            except KeyboardInterrupt:
+                _stop(list(active))
+                raise
 
     return failed

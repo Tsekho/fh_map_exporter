@@ -1,6 +1,5 @@
 """Region geometry, deep-water spawning, and per-region spill builder."""
 
-import json
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -14,6 +13,8 @@ from utils.blender import (
 from utils.config import (
     CATEGORY_COLORS,
     DEEP_WATER_DEPTH,
+    PURGE,
+    PURGE_TOLERANCE,
     SPLINE_CATEGORIES,
     short_path,
 )
@@ -250,7 +251,8 @@ def build_region_with_spill(
     neighbor_include = sorted(allowed_neighbor_meshes)
     neighbor_exclude = sorted(water_meshes)
 
-    own_map = Map(own_json, export_dir, include=focus_include, palette=palette)
+    own_map = Map(own_json, export_dir, include=focus_include, palette=palette,
+                  purge=PURGE.get(own_name), purge_tolerance=PURGE_TOLERANCE)
 
     clear_caches()
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -394,6 +396,8 @@ def build_region_with_spill(
             neigh_json, export_dir,
             include=neighbor_include,
             exclude=neighbor_exclude,
+            purge=PURGE.get(neigh_name),
+            purge_tolerance=PURGE_TOLERANCE,
         )
         neigh_cat_objs: Dict[str, List[bpy.types.Object]] = {}
         placed_n = neigh_map._populate_by_category(
@@ -438,9 +442,7 @@ def build_region_with_spill(
             for n in names:
                 mesh_to_spline_cat[n] = cat
 
-        with open(own_json, "r", encoding="utf-8") as _f:
-            _raw = json.load(_f)
-        raw_splines: Dict[str, list] = _raw.get("splines", {}) or {}
+        raw_splines: Dict[str, list] = own_map.raw_splines
 
         spline_mat = make_color_material(spline_color)
         splines_root: Optional[bpy.types.Collection] = None

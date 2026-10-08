@@ -25,6 +25,7 @@ __all__ = [
     "select_one",
     "confirm",
     "heading",
+    "error", "warn", "done", "run",
     "Progress",
     "bold", "cyan", "green", "yellow", "red", "dim", "glyph",
 ]
@@ -76,6 +77,22 @@ def _probe() -> None:
 
 
 _GLYPH_PROBE = "❯✓─↑←…·"
+_PROBED = False
+
+
+def _auto_probe() -> None:
+    """Probe once, on the first styled output, but only for a terminal:
+    piped output (and FH_NO_TUI) stays free of escape codes."""
+    global _PROBED
+    if _PROBED:
+        return
+    _PROBED = True
+    try:
+        tty = sys.stdout.isatty()
+    except Exception:
+        tty = False
+    if tty and not os.environ.get("FH_NO_TUI"):
+        _probe()
 
 
 def _can_encode(text: str) -> bool:
@@ -117,6 +134,7 @@ def supports_tui() -> bool:
 # ------------------------------------------------------------------------------
 
 def _c(code: str, text: str) -> str:
+    _auto_probe()
     return f"\x1b[{code}m{text}\x1b[0m" if _COLOR else text
 
 
@@ -149,6 +167,7 @@ def _grey(t: str) -> str:
 
 
 def _glyph(fancy: str, plain: str) -> str:
+    _auto_probe()
     return fancy if _UNICODE else plain
 
 
@@ -165,13 +184,54 @@ def _term_height() -> int:
     return max(10, shutil.get_terminal_size((100, 30)).lines)
 
 
-def heading(text: str) -> None:
-    """Print a section heading in the widgets' style."""
-    if not _COLOR:
-        _probe()
+def heading(text: str, detail: str = "") -> None:
+    """Print a section heading in the widgets' style; ``detail`` trails it
+    dimmed."""
+    _auto_probe()
     width = min(60, _term_width() - 2)
-    bar = _glyph("─", "-") * max(0, width - len(text) - 1)
-    print(f"\n{_bold(_cyan(text))} {_grey(bar)}")
+    shown = len(text) + (len(detail) + 2 if detail else 0)
+    bar = _glyph("─", "-") * max(0, width - shown - 1)
+    tail = f"  {_grey(detail)}" if detail else ""
+    print(f"\n{_bold(_cyan(text))}{tail} {_grey(bar)}")
+
+
+# Status lines. In a live terminal they lead with a coloured glyph; piped
+# (and in worker subprocesses) they lead with a word instead, so logs stay
+# greppable and progress.py still spots WARN/ERROR in worker output.
+
+def _status(color: Callable[[str], str], fancy: str, word: str,
+            text: str) -> None:
+    mark = _glyph(fancy, word) if supports_tui() else word
+    print(f"{color(mark)} {text}")
+
+
+def error(text: str) -> None:
+    _status(_red, "✗", "ERROR:", text)
+
+
+def warn(text: str) -> None:
+    _status(_yellow, "▲", "WARN:", text)
+
+
+def done(text: str) -> None:
+    _status(_green, "✓", "OK:", text)
+
+
+def run(main: Callable[[], int]) -> None:
+    """Script entry point: sys.exit(main()), with Ctrl+C reported as one
+    status line (exit code 130) instead of a traceback. Progress blocks
+    clear themselves on the way out, so the line lands below them."""
+    try:
+        code = main()
+    except KeyboardInterrupt:
+        _show_cursor()
+        from utils.progress import WORKER_ENV
+        # A worker's parent is interrupted too and says so once for all.
+        if not os.environ.get(WORKER_ENV):
+            print()
+            warn("interrupted")
+        code = 130
+    sys.exit(code)
 
 
 def _hide_cursor() -> None:
@@ -358,11 +418,14 @@ def _hint(pairs: Sequence[Sequence[str]]) -> List[str]:
 #  Widgets
 # ------------------------------------------------------------------------------
 
+# A select_one() entry drawn as a divider; it can't be picked or numbered.
+SEPARATOR = object()
+
+
 def _labels_for(items: Sequence[Any],
                 label_fn: Optional[Callable[[Any], str]]) -> List[str]:
-    if label_fn is None:
-        return [str(i) for i in items]
-    return [label_fn(i) for i in items]
+    label_fn = label_fn or str
+    return ["" if i is SEPARATOR else label_fn(i) for i in items]
 
 def _window(cursor: int, count: int, rows: int) -> int:
     """First visible row index for a viewport of ``rows`` around ``cursor``."""
@@ -501,36 +564,44 @@ def select_one(
     noun: str = "item",
 ) -> Optional[Any]:
     """Single-choice picker. ``extra`` appends a trailing pseudo-entry (e.g.
-    "Paste a path..."); choosing it returns that same string."""
+    "Paste a path..."); choosing it returns that same string. SEPARATOR
+    entries are drawn as dividers between groups."""
     labels = _labels_for(items, label_fn)
     entries: List[Any] = list(items)
     if extra is not None:
         entries.append(extra)
         labels = labels + [extra]
-    if not entries:
+    pickable = [i for i, e in enumerate(entries) if e is not SEPARATOR]
+    if not pickable:
         return None
     if not supports_tui():
         return _fallback_one(entries, labels, title, noun)
 
-    cursor = 0
+    number = {idx: n for n, idx in enumerate(pickable, 1)}
+    cursor = 0      # index into pickable
     frame = _Frame()
-    num_w = len(str(len(entries)))
+    num_w = len(str(len(pickable)))
+    rule = _grey(" " * (num_w + 4) + _glyph("─", "-") * 8)
 
     _hide_cursor()
     try:
         while True:
-            cursor = max(0, min(cursor, len(entries) - 1))
+            cursor = max(0, min(cursor, len(pickable) - 1))
+            cur = pickable[cursor]
             rows = max(3, min(len(entries), _term_height() - 7))
-            start = _window(cursor, len(entries), rows)
+            start = _window(cur, len(entries), rows)
 
             lines = [_bold(_cyan(title)), ""]
             for idx in range(start, min(start + rows, len(entries))):
-                is_cur = idx == cursor
+                if entries[idx] is SEPARATOR:
+                    lines.append(rule)
+                    continue
+                is_cur = idx == cur
                 name = labels[idx]
                 if extra is not None and idx == len(entries) - 1:
                     name = _yellow(name)
                 arrow = _cyan(_glyph("❯", ">")) if is_cur else " "
-                num = _grey(f"{idx + 1:>{num_w}}.")
+                num = _grey(f"{number[idx]:>{num_w}}.")
                 lines.append(f" {arrow} {num} "
                              f"{_bold(name) if is_cur else name}")
             if len(entries) > rows:
@@ -548,9 +619,9 @@ def select_one(
 
             key = _read_key()
             if key == "up":
-                cursor = (cursor - 1) % len(entries)
+                cursor = (cursor - 1) % len(pickable)
             elif key == "down":
-                cursor = (cursor + 1) % len(entries)
+                cursor = (cursor + 1) % len(pickable)
             elif key == "pgup":
                 cursor -= rows
             elif key == "pgdn":
@@ -558,11 +629,11 @@ def select_one(
             elif key == "home":
                 cursor = 0
             elif key == "end":
-                cursor = len(entries) - 1
+                cursor = len(pickable) - 1
             elif key == "enter":
                 frame.draw([f"{_bold(_cyan(title))}  "
-                            f"{_green(labels[cursor])}"])
-                return entries[cursor]
+                            f"{_green(labels[cur])}"])
+                return entries[cur]
             elif key in ("esc", "q", "Q"):
                 frame.draw([_grey(f"{title}: cancelled")])
                 return None
@@ -929,8 +1000,16 @@ def _fallback_many(items: Sequence[Any], labels: Sequence[str],
 def _fallback_one(entries: Sequence[Any], labels: Sequence[str],
                   title: str, noun: str) -> Optional[Any]:
     print(f"{title}:")
-    for i, name in enumerate(labels, 1):
+    i = 0
+    for e, name in zip(entries, labels):
+        if e is SEPARATOR:
+            print("       --------")
+            continue
+        i += 1
         print(f"  {i:3}. {name}")
+    picks = [(e, lb) for e, lb in zip(entries, labels) if e is not SEPARATOR]
+    entries = [e for e, _ in picks]
+    labels = [lb for _, lb in picks]
     while True:
         raw = input(f"\nSelect {noun} (number or name): ").strip()
         picked = _parse_tokens(raw, entries, labels)

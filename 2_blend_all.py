@@ -55,12 +55,12 @@ BUILD_PHASES = [
 
 def pick_map_interactive() -> Optional[List[str]]:
     if not JSON_DIR.is_dir():
-        print(f"ERROR: {JSON_DIR} not found")
+        tui.error(f"{JSON_DIR} not found")
         return None
 
     maps = _list_maps()
     if not maps:
-        print(f"ERROR: no JSON files found in {JSON_DIR}")
+        tui.error(f"no JSON files found in {JSON_DIR}")
         return None
 
     return tui.select_many(maps, "Maps to blend", noun="map")
@@ -84,17 +84,17 @@ def main() -> int:
 
     if args.all:
         if not JSON_DIR.is_dir():
-            print(f"ERROR: {JSON_DIR} not found")
+            tui.error(f"{JSON_DIR} not found")
             return 1
         map_names = _list_maps()
         if not map_names:
-            print(f"ERROR: no maps found in {JSON_DIR}")
+            tui.error(f"no maps found in {JSON_DIR}")
             return 1
         terrain = not args.no_terrain
     elif args.map_name:
         keys = _load_region_keys()
         if keys and args.map_name.lower() not in keys:
-            print(f"ERROR: '{args.map_name}' is not a region "
+            tui.error(f"'{args.map_name}' is not a region "
                   f"(missing from {CENTRES_FILE.name}); skipping")
             return 1
         map_names = [args.map_name]
@@ -107,8 +107,9 @@ def main() -> int:
         terrain = not args.no_terrain
 
     parallel = len(map_names) > 1 and NUM_WORKERS > 1
-    print(f"=== Building {len(map_names)} map(s) "
-          f"(terrain={terrain}, workers={NUM_WORKERS if parallel else 1}) ===")
+    tui.heading(f"Building {len(map_names)} map(s)",
+                f"terrain={terrain}, "
+                f"workers={NUM_WORKERS if parallel else 1}")
 
     tracker = progress.PhaseTracker(BUILD_PHASES)
 
@@ -125,15 +126,15 @@ def main() -> int:
             verbose=args.verbose,
         )
         if failed:
-            print(f"\n{len(failed)} map(s) failed: {', '.join(failed)}")
+            tui.error(f"{len(failed)} map(s) failed: {', '.join(failed)}")
             return 1
-        print(f"\n=== SUCCESS ===")
+        tui.done(f"{len(map_names)} map(s) built")
         return 0
 
     def _build(name: str) -> bool:
         json_path = JSON_DIR / f"{name}.json"
         if not json_path.exists():
-            print(f"ERROR: JSON not found: {json_path}")
+            tui.error(f"JSON not found: {json_path}")
             return False
         Map(str(json_path), str(EXPORT_DIR)).blend(terrain=terrain)
         return True
@@ -145,12 +146,12 @@ def main() -> int:
     )
 
     if errors:
-        print(f"\n{len(errors)} map(s) failed: {', '.join(errors)}")
+        tui.error(f"{len(errors)} map(s) failed: {', '.join(errors)}")
         return 1
 
-    print(f"\n=== SUCCESS ===")
+    tui.done(f"{len(map_names)} map(s) built")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    tui.run(main)

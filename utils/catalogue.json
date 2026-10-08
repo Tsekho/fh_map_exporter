@@ -1236,7 +1236,6 @@
     "Meshes__Environment__Towns__TownSidewalkCorner02"
   ],
   "ignore_spline_meshes": [
-    "Engine__Content__EditorLandscapeResources__SplineEditorMesh",
     "Meshes__Environment__Roads__RoadGreatMarch01",
     "Meshes__Environment__Roads__RoadGreatMarch01Snow",
     "Meshes__Environment__Roads__RoadT1Dirt01",
