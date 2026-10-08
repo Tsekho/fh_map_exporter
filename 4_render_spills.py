@@ -8,7 +8,8 @@ Outputs (each flag gates its own set of per-region PNGs):
               + export/heightmap_water/<Region>.png
     -id   ->  export/id/<category>/<Region>.png (incl. id/water/)
     -r    ->  export/roads/<Region>.png
-    -b    ->  export/beaches/<Region>.png
+    -b    ->  export/beaches/<Region>.png (shore sand from the Sand/WetSand
+              weightmaps + this or an earlier -id bake; no Blender needed)
     -sl   ->  export/split_layers/<layer>/<Region>.png
 
 Usage:
@@ -21,7 +22,7 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -29,7 +30,6 @@ import bpy
 
 from utils.config import (
     AO_DIR,
-    BEACHES_CATS,
     BEACHES_DIR,
     BRIDGES_AIM_DIR,
     BRIDGES_AIM_MIN_DEPTH_M,
@@ -69,6 +69,7 @@ from utils.bake import (
     render_split_layers_ao,
 )
 from utils import progress, tui
+from utils.beaches import render_beaches
 from utils.parallel import run_parallel_subprocesses
 from utils.svg_render import (
     SVG_FILE_LAYERS,
@@ -295,13 +296,14 @@ def render_one(
             print(f"  [WARN] SVG layer render failed: {exc}")
             ok = False
 
-    needs_blend = (do_ao or do_hm or do_id or do_roads or do_beaches
-                   or do_split_layers)
+    needs_blend = do_ao or do_hm or do_id or do_roads or do_split_layers
     if not needs_blend:
-        # SVG-only run: skip the multi-GB scene load, but bridges_aim is
-        # still one of this run's expected outputs -- it is procedural, not
-        # a bake, so it does not need the .blend.
+        # SVG/beaches-only run: skip the multi-GB scene load. bridges_aim
+        # and beaches are procedural (JSON, weightmaps and the ID bakes on
+        # disk), not bakes, so neither needs the .blend.
         if do_svg and not _render_bridges_aim(region_name):
+            ok = False
+        if do_beaches and not render_beaches(region_name, mask):
             ok = False
         return ok
 
@@ -509,8 +511,8 @@ def render_one(
             print(f"  [WARN] AO bake failed: {exc}")
             ok = False
 
-    def _run_spline_layer(out_dir: Path, target_cats: tuple, label: str,
-                          include_terrain: bool = True) -> bool:
+    def _run_spline_layer(out_dir: Path, target_cats: tuple,
+                          label: str) -> bool:
         """Build arguments for bake_spline_layer from region-local state
         (splines, objs, nonterrain_spline_objs) and dispatch."""
         targets: Dict[str, List[bpy.types.Object]] = {}
@@ -535,27 +537,16 @@ def render_one(
                                                                 "#FFFFFF"))
                    for c in target_cats}
 
-        if include_terrain:
-            print(_tag(
-                f"{label} (terrain dropped "
-                f"{SPLINE_LAYER_TERRAIN_DROP:.2f} m)"
-            ))
-            terrain_occluders: Optional[List[bpy.types.Object]] = list(
-                objs["terrain"]
-            )
-            terrain_drop = SPLINE_LAYER_TERRAIN_DROP
-        else:
-            print(_tag(f"{label} (terrain excluded)"))
-            terrain_occluders = None
-            terrain_drop = 0.0
-
+        print(_tag(
+            f"{label} (terrain dropped {SPLINE_LAYER_TERRAIN_DROP:.2f} m)"
+        ))
         return bake_spline_layer(
             _out(out_dir), mask,
             targets=targets,
             palette=palette,
             occluders=occluders,
-            terrain_occluders=terrain_occluders,
-            terrain_drop=terrain_drop,
+            terrain_occluders=list(objs["terrain"]),
+            terrain_drop=SPLINE_LAYER_TERRAIN_DROP,
             samples_per_side=SPLINE_LAYER_SSAA,
             label=label,
         )
@@ -592,41 +583,10 @@ def render_one(
                       "(alpha preserved)")
 
     if do_beaches:
-        if not _run_spline_layer(BEACHES_DIR, BEACHES_CATS, "beaches",
-                                 include_terrain=False):
+        # From the weightmaps and this run's (or an earlier) ID bake.
+        print(_tag("beaches (Sand/WetSand weightmaps)"))
+        if not render_beaches(region_name, mask):
             ok = False
-        else:
-            beach_path = BEACHES_DIR / f"{region_name}.png"
-            terrain_path = ID_DIR / "terrain" / f"{region_name}.png"
-            water_path = ID_DIR / "water" / f"{region_name}.png"
-            if not (terrain_path.is_file() and water_path.is_file()):
-                print("  [WARN] beaches land-mask skipped "
-                      "(missing per-region terrain/water ID PNG)")
-            else:
-                beach_img = cv2.imread(str(beach_path), cv2.IMREAD_UNCHANGED)
-                terrain_cov = cv2.imread(str(terrain_path),
-                                         cv2.IMREAD_GRAYSCALE)
-                water_cov = cv2.imread(str(water_path),
-                                       cv2.IMREAD_GRAYSCALE)
-                if (beach_img is None or terrain_cov is None
-                        or water_cov is None or beach_img.ndim != 3
-                        or beach_img.shape[2] != 4):
-                    print("  [WARN] beaches land-mask skipped "
-                          "(unreadable or non-RGBA inputs)")
-                else:
-                    non_water = (255 - water_cov).astype(np.uint16)
-                    land = (
-                        (terrain_cov.astype(np.uint16) * non_water + 127)
-                        // 255
-                    )
-                    new_alpha = (
-                        (beach_img[..., 3].astype(np.uint16) * land + 127)
-                        // 255
-                    ).astype(np.uint8)
-                    beach_img[..., 3] = new_alpha
-                    cv2.imwrite(str(beach_path), beach_img)
-                    print("  [beaches] alpha masked to land "
-                          "(terrain * non-water)")
 
     if do_split_layers:
         batch: List[Tuple[str, List[Tuple[List[bpy.types.Object], str]], str]] = []
@@ -745,6 +705,19 @@ def _expected_outputs(flags: Flags) -> int:
     )
 
 
+def _id_stale(blend: Path, cats: Sequence[str]) -> bool:
+    """True when any of these ID category bakes is missing or older than
+    the region's spill .blend it is baked from."""
+    try:
+        blend_mtime = blend.stat().st_mtime
+        return any(
+            (ID_DIR / cat / f"{blend.stem}.png").stat().st_mtime < blend_mtime
+            for cat in cats
+        )
+    except OSError:
+        return True
+
+
 def pick_region_interactive(blends: List[Path]) -> Optional[List[Path]]:
     return tui.select_many(
         blends, "Regions to render",
@@ -805,7 +778,8 @@ def main() -> int:
     parser.add_argument("-r", dest="do_roads", action="store_true",
                         help="Render the roads layer")
     parser.add_argument("-b", dest="do_beaches", action="store_true",
-                        help="Render the beaches layer")
+                        help="Render the beaches layer (Sand/WetSand "
+                        "weightmaps; needs id/water and id/terrain)")
     parser.add_argument("-sl", dest="do_split_layers", action="store_true",
                         help="Render the SPLIT_LAYERS bakes")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -815,7 +789,7 @@ def main() -> int:
 
     blends = _list_blends()
     if not blends:
-        print(f"ERROR: no .blend files found in {SPILL_DIR}")
+        tui.error(f"no .blend files found in {SPILL_DIR}")
         return 1
 
     interactive_bakes = False
@@ -827,7 +801,7 @@ def main() -> int:
             None,
         )
         if match is None:
-            print(f"ERROR: '{args.region_name}' not in {SPILL_DIR}")
+            tui.error(f"'{args.region_name}' not in {SPILL_DIR}")
             return 1
         targets = [match]
     else:
@@ -858,36 +832,63 @@ def main() -> int:
 
     if not (do_ao or do_hm or do_id or do_roads or do_beaches
             or do_split_layers or do_svg):
-        print("ERROR: every bake was disabled; nothing to do")
+        tui.error("every bake was disabled; nothing to do")
         return 1
 
     if not MASK_FILE.is_file():
-        print(f"ERROR: mask not found at {MASK_FILE}")
+        tui.error(f"mask not found at {MASK_FILE}")
         return 1
     raw = cv2.imread(str(MASK_FILE), cv2.IMREAD_GRAYSCALE)
     if raw is None:
-        print(f"ERROR: cv2 failed to read {MASK_FILE}")
+        tui.error(f"cv2 failed to read {MASK_FILE}")
         return 1
     mask = raw > 127
 
-    # An SVG-only run never loads a .blend, so it is not bound by the
+    # -b and -svg (bridges_aim) read the ID bake off disk; like step 5's
+    # stage prerequisites, pull -id into the run for each region whose ID
+    # categories they read are missing or stale.
+    id_cats = (["water", "terrain"] if do_beaches else [])         + (["water"] if do_svg else [])
+    readers = [n for n, on in (("beaches", do_beaches),
+                               ("bridges_aim", do_svg)) if on]
+    id_pulled: set = set()
+    if id_cats and not do_id:
+        id_pulled = {b for b in targets if _id_stale(b, id_cats)}
+        if id_pulled:
+            names = sorted(b.stem for b in id_pulled)
+            shown = ", ".join(names[:6]) + (" ..." if len(names) > 6 else "")
+            verb = "read" if len(readers) > 1 else "reads"
+            why = (f"{' and '.join(readers)} {verb} it, "
+                   f"and it is missing or stale")
+            print(f"  {tui.cyan('+')} id  {tui.dim(why)}"
+                  f"  ({len(names)} region(s): {shown})")
+
+    def id_for(blend: Path) -> bool:
+        return do_id or blend in id_pulled
+
+    # An SVG/beaches-only run never loads a .blend, so it is not bound by the
     # per-worker memory ceiling that sizes NUM_WORKERS_SPILLS.
-    needs_blend = (do_ao or do_hm or do_id or do_roads or do_beaches
-                   or do_split_layers)
+    needs_blend = (do_ao or do_hm or do_id or do_roads or do_split_layers
+                   or bool(id_pulled))
     n_workers = NUM_WORKERS_SPILLS if needs_blend else NUM_WORKERS_SVG
 
     parallel = len(targets) > 1 and n_workers > 1
-    print(f"=== Rendering {len(targets)} region(s) "
-          f"(svg={do_svg}, ao={do_ao}, hm={do_hm}, id={do_id}, "
-          f"roads={do_roads}, beaches={do_beaches}, "
-          f"split_layers={do_split_layers}, "
-          f"workers={n_workers if parallel else 1}) ===")
+    bakes = [name for name, on in (
+        ("svg", do_svg), ("ao", do_ao), ("hm", do_hm),
+        ("id" if do_id else f"id({len(id_pulled)})", do_id or bool(id_pulled)),
+        ("roads", do_roads), ("beaches", do_beaches),
+        ("split_layers", do_split_layers)) if on]
+    tui.heading(f"Rendering {len(targets)} region(s)",
+                f"{' '.join(bakes)}, "
+                f"workers={n_workers if parallel else 1}")
 
-    flags: Flags = (do_svg, do_ao, do_hm, do_id,
-                    do_roads, do_beaches, do_split_layers)
+    def flags_for(blend: Path) -> Flags:
+        return (do_svg, do_ao, do_hm, id_for(blend),
+                do_roads, do_beaches, do_split_layers)
+
     tracker = progress.FileTracker(
-        candidates=lambda blend: _output_candidates(blend.stem, flags),
-        expected=lambda _blend: _expected_outputs(flags),
+        candidates=lambda blend: _output_candidates(blend.stem,
+                                                    flags_for(blend)),
+        expected=lambda blend: _expected_outputs(flags_for(blend)),
         # "[bake 3/11] AO" -> the bar's status column.
         status_re=r"\[bake\s+\d+/\d+\]\s+(.+)",
     )
@@ -901,7 +902,7 @@ def main() -> int:
                 argv.append("-ao")
             if do_hm:
                 argv.append("-hm")
-            if do_id:
+            if id_for(blend):
                 argv.append("-id")
             if do_roads:
                 argv.append("-r")
@@ -915,8 +916,8 @@ def main() -> int:
         import os as _os
         cores = _os.cpu_count() or 4
         per_worker = max(2, cores // n_workers)
-        print(f"    (row-pool threads per worker: {per_worker} "
-              f"of {cores} cores)")
+        print(tui.dim(f"  row-pool threads per worker: {per_worker} "
+                      f"of {cores} cores"))
 
         failed_items = run_parallel_subprocesses(
             targets, _cmd,
@@ -931,14 +932,15 @@ def main() -> int:
         )
         if failed_items:
             names = [b.stem for b in failed_items]
-            print(f"\n{len(names)} region(s) had issues: {', '.join(names)}")
+            tui.error(f"{len(names)} region(s) had issues: "
+                      f"{', '.join(names)}")
             return 1
-        print(f"\n=== SUCCESS ===")
+        tui.done(f"{len(targets)} region(s) rendered")
         return 0
 
     failed_targets = progress.run_serial(
         targets,
-        lambda blend: render_one(blend, mask, do_ao, do_hm, do_id,
+        lambda blend: render_one(blend, mask, do_ao, do_hm, id_for(blend),
                                  do_roads, do_beaches, do_split_layers,
                                  do_svg),
         title="Rendering bakes",
@@ -951,12 +953,13 @@ def main() -> int:
 
     if failed_targets:
         failed = [b.stem for b in failed_targets]
-        print(f"\n{len(failed)} region(s) had issues: {', '.join(failed)}")
+        tui.error(f"{len(failed)} region(s) had issues: "
+                  f"{', '.join(failed)}")
         return 1
 
-    print(f"\n=== SUCCESS ===")
+    tui.done(f"{len(targets)} region(s) rendered")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    tui.run(main)

@@ -1,0 +1,43 @@
+{
+  "name": "CustomMapMod",
+  "root": "export/_final",
+  "layers": [
+    "assembly/base_layer.png",
+    "assembly/dive_alert.png",
+    {"file": "assembly/contours.png", "opacity": 64},
+    "svg_layers/drop_pads.png",
+    "assembly/beaches.png",
+    {"file": "svg_layers/foliage_invis.png", "mask": "id/terrain.png"},
+    {"file": "svg_layers/foliage.png", "mask": "id/terrain.png"},
+
+    "assembly/bridges_aim.png",
+
+    {"shadow": ["assembly/roads_fix.png", "assembly/roads.png", "svg_layers/bridges.png"]},
+    "assembly/roads_fix.png",
+    "assembly/roads.png",
+    "svg_layers/bridges.png",
+    {"shadow": ["split_layers/houses.png", "split_layers/industry.png", "split_layers/ghouses.png"]},
+    "split_layers/houses.png",
+    "split_layers/industry.png",
+    "split_layers/ghouses.png",
+
+    "svg_layers/highlights.png",
+
+    "split_layers/obstacles.png",
+    "assembly/ranges.png",
+
+    "svg_layers/runways_aim.png",
+
+    "svg_layers/runways.png",
+    "svg_layers/ladders.png",
+    "svg_layers/wells.png",
+    "svg_layers/urban.png",
+    "svg_layers/garrisons.png",
+
+    {"file": "assembly/rdz.png", "opacity": 100},
+    "assembly/no_intel_pattern.png",
+    "assembly/grid_pattern.png",
+
+    "assembly/fly_alert.png"
+  ]
+}

@@ -1,12 +1,14 @@
 """Stitch step-4 bakes into world PNGs and assemble final composites.
 
 Writes to ``export/_final/``: ``technical/`` (ao, heightmap_simple, contour),
-``assembly/`` (base_layer, beaches, roads, fly_alert, dive_alert, contours,
-rdz, ranges, bridges_aim), and verbatim ``id/``, ``split_layers/``,
-``svg_layers/``.
+``assembly/`` (base_layer, beaches, roads, roads_fix, fly_alert, dive_alert,
+contours, rdz, ranges, bridges_aim, grid_pattern, no_intel_pattern), and verbatim
+``id/``, ``split_layers/``, ``svg_layers/``.
 
 Each output is a named stage, built only when asked for and only when its
-inputs are newer than what is already on disk. Shared intermediates (the
+inputs (plus the hex mask and region centres every stage stitches through)
+are newer than what is already on disk, or the config settings it reads
+have changed since it was last built. Shared intermediates (the
 stitched ID coverage, heightmaps, world alpha) are built on first use and
 freed once no remaining stage needs them. Where one stage reads another's
 written output (rdz and ranges read the stitched svg_layers), the producer
@@ -21,9 +23,11 @@ Usage:
 
 import argparse
 import colorsys
+import hashlib
 import json
 import os
 import random
+import shutil
 import sys
 import time
 import traceback
@@ -34,6 +38,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
+from utils import config as _config
 from utils import progress, tui
 
 from utils.config import (
@@ -46,6 +51,7 @@ from utils.config import (
     DIVE_ALERT_GRADIENT,
     FINAL_DIR,
     FLY_ALERT_PATTERN_FILE,
+    GRID_TILE_FILE,
     HM_LANDSCAPE_DIR,
     HM_WATER_DIR,
     ID_DIR,
@@ -53,8 +59,10 @@ from utils.config import (
     LAYER_COLORS,
     LAYERS_DIR,
     MASK_FILE,
-    RDZ_PATTERN_FILE,
+    NO_INTEL_TILE_FILE,
+    RDZ_TILE_FILE,
     ROADS_DIR,
+    ROADS_FIX_FILE,
     SHADES_BLUR_KSIZE,
     SHADES_BLUR_SIGMA,
     SPLIT_LAYERS,
@@ -783,22 +791,9 @@ def _mul_alpha(rgba: np.ndarray, coef01: np.ndarray) -> np.ndarray:
     return out
 
 
-def build_rdz(height: int, width: int, out_path: Path) -> None:
-    """rdz_pattern with svg_layers/rdz_grace punching holes in its alpha."""
-    pattern = cv2.imread(str(RDZ_PATTERN_FILE), cv2.IMREAD_UNCHANGED)
-    if pattern is None:
-        print(f"  [WARN] {RDZ_PATTERN_FILE} not found; skipping rdz")
-        return
-    if pattern.ndim == 2:
-        pattern = cv2.cvtColor(pattern, cv2.COLOR_GRAY2BGRA)
-    elif pattern.shape[2] == 3:
-        pattern = cv2.cvtColor(pattern, cv2.COLOR_BGR2BGRA)
-    ph, pw = pattern.shape[:2]
-    if (ph, pw) != (height, width):
-        reps_y = (height + ph - 1) // ph
-        reps_x = (width + pw - 1) // pw
-        pattern = np.tile(pattern, (reps_y, reps_x, 1))[:height, :width]
-
+def build_rdz(pattern: np.ndarray, out_path: Path) -> None:
+    """World rdz pattern with svg_layers/rdz_grace punching holes in its
+    alpha."""
     grace = _load_svg_layer("rdz_grace")
     if grace is not None:
         keep = 1.0 - (grace[..., 3].astype(np.float32) / 255.0)
@@ -1002,6 +997,36 @@ def _final(rel: str) -> Path:
     return FINAL_DIR / rel
 
 
+# Fingerprints of the settings each stage was last built with, so changing
+# one (a colour, a blur, a gradient) makes exactly the stages reading it
+# stale. Code changes are not tracked; -f covers those.
+SETTINGS_RECORD = FINAL_DIR / ".stage_settings.json"
+
+
+def _settings_digest(names: Sequence[str]) -> str:
+    """Hash of the current values of these settings (utils/config.py, or
+    this module's own constants)."""
+    values = [(n, getattr(_config, n, globals().get(n))) for n in names]
+    return hashlib.sha1(repr(values).encode("utf-8")).hexdigest()
+
+
+def _recorded_settings() -> Dict[str, str]:
+    try:
+        return json.loads(SETTINGS_RECORD.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _record_settings(stage: "Stage") -> None:
+    if not stage.settings:
+        return
+    rec = _recorded_settings()
+    rec[stage.name] = _settings_digest(stage.settings)
+    SETTINGS_RECORD.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_RECORD.write_text(json.dumps(rec, indent=2, sort_keys=True),
+                               encoding="utf-8")
+
+
 class Stage:
     """One named output: what it writes, what it reads, how to build it."""
 
@@ -1010,7 +1035,8 @@ class Stage:
                  outputs: Callable[[], List[Path]],
                  inputs: Callable[[], List[Path]],
                  needs: Sequence[str] = (),
-                 requires: Sequence[str] = ()) -> None:
+                 requires: Sequence[str] = (),
+                 settings: Sequence[str] = ()) -> None:
         self.name = name
         self.describe = describe
         self.run = run
@@ -1021,16 +1047,31 @@ class Stage:
         # Stages whose written output this one reads, pulled into the run
         # when their files are missing or stale.
         self.requires = tuple(requires)
+        # Config settings this stage's output depends on.
+        self.settings = tuple(settings)
 
     def up_to_date(self) -> bool:
-        """True when every output exists and no input has changed since. A
-        missing input dir counts as unchanged: there is nothing to redo."""
+        """True when every output exists, no input has changed since, and
+        every stage it requires is up to date too (a stale svg_layers means
+        the ranges built from it are stale, even before it is restitched).
+        A missing input dir counts as unchanged: there is nothing to redo."""
+        by_name = {s.name: s for s in STAGES}
+        if any(not by_name[r].up_to_date()
+               for r in self.requires if r in by_name):
+            return False
         outs = self.outputs()
         if not outs or not all(p.is_file() and p.stat().st_size
                                for p in outs):
             return False
         oldest_out = min(p.stat().st_mtime for p in outs)
-        return _newest_mtime(self.inputs()) <= oldest_out
+        # Every stage stitches or clones through the hex mask and region
+        # centres, so those count as inputs of all of them.
+        inputs = list(self.inputs()) + [MASK_FILE, CENTRES_FILE]
+        if _newest_mtime(inputs) > oldest_out:
+            return False
+        return (not self.settings
+                or _recorded_settings().get(self.name)
+                == _settings_digest(self.settings))
 
 
 def _newest_mtime(paths: Sequence[Path]) -> float:
@@ -1060,6 +1101,62 @@ def _stitch_stage(label: str, src_dir: Path, out_rel: str, *,
             return
         out_path = _final(out_rel)
         _write_with_alpha(canvas, ctx.world_alpha, out_path)
+        LOG.saved(out_path)
+
+    return _run
+
+
+def _clone_tile(ctx: Ctx, label: str, tile_file: Path) -> np.ndarray | None:
+    """World canvas with one hex-sized pattern cloned into every region,
+    clipped by the hex mask, so the pattern can be redrawn as one tile.
+    None (with a warning) when the tile is missing."""
+    tile = cv2.imread(str(tile_file), cv2.IMREAD_UNCHANGED)
+    if tile is None:
+        print(f"  [WARN] {tile_file} not found; skipping {label}")
+        return None
+    if tile.shape[:2] != (TILE_SIZE, TILE_SIZE):
+        raise ValueError(f"{tile_file.name} is {tile.shape[1]}x"
+                         f"{tile.shape[0]}, expected one hex "
+                         f"({TILE_SIZE}x{TILE_SIZE})")
+    print(f"=== cloning {label} into {len(ctx.centres)} regions ===")
+    return stitch({name.lower(): tile_file for name in ctx.centres},
+                  ctx.centres, ctx.mask, ctx.height, ctx.width,
+                  channels=4, dtype=np.uint8,
+                  read_flag=cv2.IMREAD_UNCHANGED)
+
+
+def _clone_stage(label: str, tile_file: Path,
+                 out_rel: str) -> Callable[[Ctx], None]:
+    """Stage body that writes _clone_tile() as is."""
+
+    def _run(ctx: Ctx) -> None:
+        canvas = _clone_tile(ctx, label, tile_file)
+        if canvas is None:
+            return
+        out_path = _final(out_rel)
+        _write_rgba(canvas, out_path)
+        LOG.saved(out_path)
+
+    return _run
+
+
+def _copy_stage(label: str, src_file: Path,
+                out_rel: str) -> Callable[[Ctx], None]:
+    """Stage body for a hand-made world layer shipped as is."""
+
+    def _run(ctx: Ctx) -> None:
+        if not src_file.is_file():
+            print(f"  [WARN] {src_file} not found; skipping {label}")
+            return
+        out_path = _final(out_rel)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out_path.with_suffix(".partial.png")
+        try:
+            shutil.copyfile(src_file, tmp)
+            os.replace(tmp, out_path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
         LOG.saved(out_path)
 
     return _run
@@ -1166,7 +1263,9 @@ def _run_base_layer(ctx: Ctx) -> None:
 
 
 def _run_rdz(ctx: Ctx) -> None:
-    build_rdz(ctx.height, ctx.width, _final(f"{ASSEMBLY_DIR}/rdz.png"))
+    pattern = _clone_tile(ctx, "rdz", RDZ_TILE_FILE)
+    if pattern is not None:
+        build_rdz(pattern, _final(f"{ASSEMBLY_DIR}/rdz.png"))
 
 
 def _run_ranges(ctx: Ctx) -> None:
@@ -1198,6 +1297,11 @@ STAGES: List[Stage] = [
                         channels=4, read_flag=cv2.IMREAD_UNCHANGED),
           lambda: [_final(f"{ASSEMBLY_DIR}/roads.png")], lambda: [ROADS_DIR],
           needs=("world_alpha",)),
+    Stage("roads_fix", "assembly/roads_fix.png",
+          _copy_stage("roads_fix", ROADS_FIX_FILE,
+                      f"{ASSEMBLY_DIR}/roads_fix.png"),
+          lambda: [_final(f"{ASSEMBLY_DIR}/roads_fix.png")],
+          lambda: [ROADS_FIX_FILE]),
     Stage("beaches", "assembly/beaches.png",
           _stitch_stage("beaches", BEACHES_DIR, f"{ASSEMBLY_DIR}/beaches.png",
                         channels=4, read_flag=cv2.IMREAD_UNCHANGED),
@@ -1230,7 +1334,9 @@ STAGES: List[Stage] = [
           lambda: [_final(f"{ASSEMBLY_DIR}/fly_alert.png")],
           lambda: [HM_LANDSCAPE_DIR, ID_DIR / "rocks",
                    FLY_ALERT_PATTERN_FILE],
-          needs=("raw_landscape", "id_coverage", "height_offset_m")),
+          needs=("raw_landscape", "id_coverage", "height_offset_m"),
+          settings=("FLY_ALERT_MIN_M", "FLY_ALERT_MAX_M",
+                    "HEIGHT_OFFSETS_CM")),
     Stage("contour", "technical/contour.png", _run_contour,
           lambda: [_final(f"{TECHNICAL_DIR}/contour.png")],
           lambda: [HM_LANDSCAPE_DIR, ID_DIR / "terrain"],
@@ -1239,26 +1345,43 @@ STAGES: List[Stage] = [
           _run_heightmap_simple,
           lambda: [_final(f"{TECHNICAL_DIR}/heightmap_simple.png")],
           lambda: [HM_WATER_DIR],
-          needs=("raw_water", "world_alpha", "height_offset_m")),
+          needs=("raw_water", "world_alpha", "height_offset_m"),
+          settings=("HEIGHT_OFFSETS_CM",)),
     Stage("dive_alert", "assembly/dive_alert.png", _run_dive_alert,
           lambda: [_final(f"{ASSEMBLY_DIR}/dive_alert.png")],
           lambda: [HM_LANDSCAPE_DIR, HM_WATER_DIR, ID_DIR / "water"],
           needs=("raw_landscape", "raw_water", "id_coverage",
-                 "world_alpha")),
+                 "world_alpha"),
+          settings=("DIVE_ALERT_GRADIENT", "DIVE_ALERT_BLUR_KSIZE",
+                    "DIVE_ALERT_BLUR_SIGMA")),
     Stage("base_layer", "assembly/base_layer.png", _run_base_layer,
           lambda: [_final(f"{ASSEMBLY_DIR}/base_layer.png")],
           lambda: [AO_DIR, ID_DIR, LAYERS_DIR, HM_LANDSCAPE_DIR],
           needs=("world_alpha", "ao", "id_coverage", "shades",
-                 "ground_u8", "ground01", "raw_landscape", "highs_lows")),
+                 "ground_u8", "ground01", "raw_landscape", "highs_lows"),
+          settings=("ID_RECOLOR", "LAYER_COLORS", "SHADES_BLUR_KSIZE",
+                    "SHADES_BLUR_SIGMA", "HM_SPLIT_M")),
     Stage("contours", "assembly/contours.png", _run_contours,
           lambda: [_final(f"{ASSEMBLY_DIR}/contours.png")],
           lambda: [HM_LANDSCAPE_DIR, ID_DIR],
           needs=("raw_landscape", "contour_rgba", "id_coverage",
-                 "ground_u8", "ground01", "water01", "world_alpha")),
+                 "ground_u8", "ground01", "water01", "world_alpha"),
+          settings=("CONTOURS_BLUR_KSIZE",)),
     Stage("rdz", "assembly/rdz.png", _run_rdz,
           lambda: [_final(f"{ASSEMBLY_DIR}/rdz.png")],
-          lambda: [RDZ_PATTERN_FILE, _final("svg_layers/rdz_grace.png")],
+          lambda: [RDZ_TILE_FILE, MASK_FILE,
+                   _final("svg_layers/rdz_grace.png")],
           needs=(), requires=("svg_layers",)),
+    Stage("grid_pattern", "assembly/grid_pattern.png",
+          _clone_stage("grid_pattern", GRID_TILE_FILE,
+                       f"{ASSEMBLY_DIR}/grid_pattern.png"),
+          lambda: [_final(f"{ASSEMBLY_DIR}/grid_pattern.png")],
+          lambda: [GRID_TILE_FILE, MASK_FILE]),
+    Stage("no_intel_pattern", "assembly/no_intel_pattern.png",
+          _clone_stage("no_intel_pattern", NO_INTEL_TILE_FILE,
+                       f"{ASSEMBLY_DIR}/no_intel_pattern.png"),
+          lambda: [_final(f"{ASSEMBLY_DIR}/no_intel_pattern.png")],
+          lambda: [NO_INTEL_TILE_FILE, MASK_FILE]),
     Stage("ranges", "assembly/ranges.png", _run_ranges,
           lambda: [_final(f"{ASSEMBLY_DIR}/ranges.png")],
           lambda: [ID_DIR] + [_final(f"svg_layers/{n}.png") for n in
@@ -1292,10 +1415,14 @@ def with_prerequisites(
     return [s for s in STAGES if s.name in chosen], pulled
 
 
-def pick_stages_interactive() -> Optional[List[Stage]]:
+def pick_stages_interactive(fresh: set) -> Optional[List[Stage]]:
+    """Stage picker; ``fresh`` names the stages that are already up to
+    date, tagged so it is clear up front they would be skipped."""
     return tui.select_many(
         STAGES, "Outputs to build",
-        label_fn=lambda s: f"{s.name:<17}->  {s.describe}",
+        label_fn=lambda s: (f"{s.name:<17}->  {s.describe}"
+                            + (tui.dim("  (up to date)")
+                               if s.name in fresh else "")),
         short_fn=lambda s: s.name,
         noun="output",
     )
@@ -1325,39 +1452,56 @@ def main() -> int:
     args = parser.parse_args()
 
     by_name = {s.name: s for s in STAGES}
+    # Stages picked while up to date that the run should rebuild anyway.
+    forced: set = set()
     if args.all:
         selected = list(STAGES)
     elif args.stages:
         unknown = [n for n in args.stages if n not in by_name]
         if unknown:
-            print(f"ERROR: unknown stage(s): {', '.join(unknown)}")
-            print(f"       known: {', '.join(by_name)}")
+            tui.error(f"unknown stage(s): {', '.join(unknown)}")
+            print(tui.dim(f"  known: {', '.join(by_name)}"))
             return 1
         chosen = {n for n in args.stages}
         selected = [s for s in STAGES if s.name in chosen]
     else:
-        picked = pick_stages_interactive()
+        fresh = set() if args.force else {
+            s.name for s in STAGES if s.up_to_date()}
+        picked = pick_stages_interactive(fresh)
         if picked is None:
             return 1
         # Declaration order, whatever order they were ticked in.
         chosen = {s.name for s in picked}
         selected = [s for s in STAGES if s.name in chosen]
+        stale_picks = [s.name for s in selected if s.name in fresh]
+        if stale_picks:
+            shown = ", ".join(stale_picks[:6])
+            if len(stale_picks) > 6:
+                shown += f" (+{len(stale_picks) - 6} more)"
+            print(tui.dim(f"  up to date: {shown}"))
+            rebuild = tui.confirm(
+                f"Rebuild {len(stale_picks)} up-to-date output(s) anyway?",
+                default=False)
+            if rebuild is None:
+                return 1
+            if rebuild:
+                forced = set(stale_picks)
 
     selected, pulled = with_prerequisites(selected)
     for added, because in pulled:
-        print(f"    + {added} (its output is what {because} reads, "
-              f"and it is missing or stale)")
+        print(f"  {tui.cyan('+')} {added}  "
+              f"{tui.dim(f'{because} reads it, and it is missing or stale')}")
 
     try:
         centres = load_centres()
         mask = load_mask()
     except FileNotFoundError as exc:
-        print(f"ERROR: {exc}")
+        tui.error(f"{exc}")
         return 1
 
     height, width = canvas_size(centres)
-    print(f"=== Finalizing {len(selected)} output(s) "
-          f"({width}x{height} px, {len(centres)} regions) ===")
+    tui.heading(f"Finalizing {len(selected)} output(s)",
+                f"{width}x{height} px, {len(centres)} regions")
 
     FINAL_DIR.mkdir(parents=True, exist_ok=True)
     ctx = Ctx(centres, mask, height, width)
@@ -1367,7 +1511,7 @@ def main() -> int:
 
     t0 = time.time()
     failed: List[str] = []
-    skipped = 0
+    skipped: List[str] = []
     tracker = progress.Tracker()
 
     def _free_after(pos: int) -> None:
@@ -1379,11 +1523,12 @@ def main() -> int:
                       stream=console) as disp:
         disp.start("stages", "outputs", len(selected))
         for pos, stage in enumerate(selected):
-            if not args.force and stage.up_to_date():
+            if (not args.force and stage.name not in forced
+                    and stage.up_to_date()):
                 disp.log(f"{tui.dim(tui.glyph(chr(0xB7), '-'))} "
-                         f"{stage.name}  {tui.dim('up to date')}")
+                         f"{stage.name}  {tui.dim('up to date, skipped')}")
                 disp.update("stages", advance=1, status=stage.name)
-                skipped += 1
+                skipped.append(stage.name)
                 _free_after(pos)
                 continue
             disp.update("stages", status=stage.name)
@@ -1398,6 +1543,7 @@ def main() -> int:
                     trace = traceback.format_exc().rstrip()
                     failed.append(stage.name)
             if not reason:
+                _record_settings(stage)
                 disp.log(f"{tui.green(tui.glyph(chr(0x2713), '+'))} "
                          f"{stage.name}  "
                          f"{tui.dim(f'{time.time() - started:.1f}s')}")
@@ -1415,14 +1561,14 @@ def main() -> int:
 
     took = time.time() - t0
     if skipped:
-        print(f"    {skipped} stage(s) already up to date "
-              f"(use -f to rebuild)")
+        tui.warn(f"{len(skipped)} stage(s) skipped as up to date "
+                 f"(-f to rebuild): {', '.join(skipped)}")
     if failed:
-        print(f"\n{len(failed)} stage(s) failed: {', '.join(failed)}")
+        tui.error(f"{len(failed)} stage(s) failed: {', '.join(failed)}")
         return 1
-    print(f"\n=== SUCCESS (in {took:.2f}s) ===")
+    tui.done(f"finalized in {took:.2f}s")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    tui.run(main)

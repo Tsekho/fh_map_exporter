@@ -21,12 +21,20 @@ from utils.psk import clear_caches, get_mesh, mesh_cache
 from utils.config import short_path
 
 
+def _transforms_match(a: List[float], b: List[float], tol: float) -> bool:
+    return len(a) == len(b) and all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
 class Map:
     """One Foxhole map.
 
     include/exclude: fnmatch patterns against mesh names (include first,
     then exclude). Blueprint _self keys are never filtered.
     palette: {fnmatch_pattern: '#RRGGBB'}; first matching pattern wins.
+    purge: {section: [(key, transform)]} instances to leave out entirely
+    (see config.PURGE). Sections are symbols/groups/splines, matched on the
+    instance's own transform, and blueprints, matched on its _self;
+    transforms match within purge_tolerance.
     """
 
     def __init__(
@@ -36,6 +44,8 @@ class Map:
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         palette: Optional[Dict[str, str]] = None,
+        purge: Optional[Dict[str, List[Tuple[str, List[float]]]]] = None,
+        purge_tolerance: float = 0.005,
     ) -> None:
         self.json_path = json_path
         self.export_dir = export_dir
@@ -58,6 +68,29 @@ class Map:
         raw_groups: Dict[str, list] = data.get("groups", {})
         raw_blueprints: Dict[str, list] = data.get("blueprints", {})
         raw_splines: Dict[str, list] = data.get("splines", {})
+
+        sections = {"symbols": raw_symbols, "groups": raw_groups,
+                    "splines": raw_splines, "blueprints": raw_blueprints}
+        for section, targets in (purge or {}).items():
+            raw = sections[section]
+            for key, tf in targets:
+                instances = raw.get(key, [])
+                kept_insts = [
+                    inst for inst in instances
+                    if not _transforms_match(
+                        inst.get("_self", []) if section == "blueprints"
+                        else inst, tf, purge_tolerance)
+                ]
+                if len(kept_insts) == len(instances):
+                    print(f"  [WARN] purge: {section} {key} at {tf} not "
+                          f"found in {self.name}")
+                    continue
+                raw[key] = kept_insts
+                print(f"  purged {len(instances) - len(kept_insts)}x "
+                      f"{section} {key} from {self.name}")
+        # Splines left after the purge, before include/exclude: the spill
+        # builder places them by its own SPLINE_CATEGORIES lookup.
+        self.raw_splines = raw_splines
 
         self.symbols = {k: v for k, v in raw_symbols.items() if self._should_place(k)}
         self.groups = {k: v for k, v in raw_groups.items() if self._should_place(k)}

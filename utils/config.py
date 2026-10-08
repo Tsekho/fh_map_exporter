@@ -9,7 +9,7 @@ what the current working directory is when it runs.
 """
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from utils.foxhole_locator import find_foxhole_pak
 
@@ -37,11 +37,20 @@ def short_path(p) -> str:
 UTILS_DIR           = REPO_ROOT / "utils"
 CENTRES_FILE        = UTILS_DIR / "region_centers.json"
 CATALOGUE_FILE      = UTILS_DIR / "catalogue.json"
-MASK_FILE           = UTILS_DIR / "mask.png"
-FLY_ALERT_PATTERN_FILE = UTILS_DIR / "fly_alert_pattern.png"
-RDZ_PATTERN_FILE    = UTILS_DIR / "rdz_pattern.png"
+
+# Hand-made inputs. mask.png and the *_TILE_FILE patterns are one hex
+# (TILE_SIZE x TILE_SIZE); the rest are world-sized. fly_alert stays
+# world-sized because its diagonals run across hex borders.
+IMG_DIR             = UTILS_DIR / "img"
+MASK_FILE           = IMG_DIR / "mask.png"
+FLY_ALERT_PATTERN_FILE = IMG_DIR / "fly_alert_pattern.png"
+RDZ_TILE_FILE       = IMG_DIR / "rdz_pattern.png"
+ROADS_FIX_FILE      = IMG_DIR / "roads_fix.png"
+GRID_TILE_FILE      = IMG_DIR / "grid_pattern.png"
+NO_INTEL_TILE_FILE  = IMG_DIR / "no_intel_pattern.png"
 
 EXPORT_DIR          = REPO_ROOT / "export"
+HASHES_FILE         = EXPORT_DIR / "hashes.txt"
 JSON_DIR            = EXPORT_DIR / "_json"
 MESHES_DIR          = EXPORT_DIR / "_meshes"
 HEIGHTMAP_DIR       = EXPORT_DIR / "_heightmap"
@@ -116,6 +125,58 @@ CYCLES_USE_CPU_WITH_GPU = False
 # 1_export.py is responsible for reporting that to the user. Override with
 # the FOXHOLE_PAK_PATH environment variable for non-Steam/unusual installs.
 FOXHOLE_PAK: Optional[Path] = find_foxhole_pak()
+
+# Length of the truncated SHA-256 1_export.py writes per region JSON to
+# HASHES_FILE -- just enough to see which regions changed between exports.
+JSON_HASH_LEN = 8
+
+
+# ------------------------------------------------------------------------------
+#  Purge list
+# ------------------------------------------------------------------------------
+
+# Instances 3_blend_spills.py leaves out of every spill build, the region's
+# own and its neighbours'. Some maps have paired scenario objects where only
+# one of the two spawns in game, one far more often than the other; keeping
+# both clutters the map, so the less likely variant goes.
+#
+# JSON stem -> JSON section -> [(key, transform)]. For symbols, groups and
+# splines the key is the mesh and the transform is the instance's own array
+# (9 floats, or 23 for a spline); for blueprints the key is the class and the
+# transform is the instance's _self. A transform matches when every component
+# is within PURGE_TOLERANCE (the exporter rounds to 2 places).
+PURGE: Dict[str, Dict[str, List[Tuple[str, List[float]]]]] = {
+    "EndlessShoreHex": {
+        "symbols": [],
+        "groups": [],
+        "splines": [],
+        "blueprints": [
+            ("UniqueWWarehouseG2_C",
+             [-49697.81, -10523.73, 146.79, 1.0, 1.0, 1.0, 0.0, 1.44, -0.0]), # Rarely spawns
+        ],
+    },
+    "FarranacCoastHex": {
+        "symbols": [],
+        "groups": [],
+        "splines": [],
+        "blueprints": [
+            ("UniqueWWarehouseG3_C",
+             [-4049.31, 13765.22, 1040.0, 1.0, 1.0, 1.0, 0.0, 16.75, -0.0]), # Rarely spawns
+            ("UniqueWWarehouseG2_C",
+             [-5720.34, 11802.08, 1076.99, 1.0, 1.0, 1.0, 0.0, 107.71, -0.0]), # Rarely spawns
+        ],
+    },
+    "CallumsCapeHex": {
+        "symbols": [],
+        "groups": [],
+        "splines": [],
+        "blueprints": [
+            ("BPCanalStair02_600Snow_C",
+             [-515.41, -45277.53, -613.91, -1.0, 1.0, 1.0, 0.0, 67.33, -0.0]), # Fully under ground
+        ],
+    },
+}
+PURGE_TOLERANCE = 0.005
 
 
 # ------------------------------------------------------------------------------
@@ -269,9 +330,23 @@ TERRAIN_WHITELIST = [
 
 # Spline categories whose meshes act as terrain for heightmap/AO/id bakes.
 TERRAIN_SPLINE_CATS = ["t1_road", "t2_road", "t3_road"]
-# Spline categories rendered into the 'roads' and 'beaches' layers.
+# Spline categories rendered into the 'roads' layer.
 ROADS_CATS   = ["t1_road", "t2_road", "t3_road"]
-BEACHES_CATS = ["beach", ]
+
+# Beaches layer (4_render_spills.py -b, utils/beaches.py). Barges deploy
+# their ramp only onto ground whose physical material is Sand or WetSand,
+# so the layer is built from those terrain weightmaps (export/_layers/,
+# named by physical material) rather than from geometry. A pixel is sand
+# when one of BEACH_LAYERS is its dominant layer; only sand reachable from
+# water through sand within BEACH_FADE_PX counts. Alpha is full up to
+# BEACH_FULL_PX from the water, fades linearly to 0 at BEACH_FADE_PX, and
+# is masked to terrain * (not water). BEACH_EDGE_BLUR_PX softens the sides
+# of the binary sand mask (0 disables).
+BEACH_LAYERS = ["Sand", "WetSand"]
+BEACH_COLOR = "#B6A177"
+BEACH_FULL_PX = 10
+BEACH_FADE_PX = 15
+BEACH_EDGE_BLUR_PX = 1.0
 
 # Regions whose terrain mesh sinks below spill meshes in places; verts
 # below TERRAIN_CULL_MIN_Z (metres) are deleted before baking so rays
@@ -286,7 +361,7 @@ TERRAIN_CULL_MIN_Z = -0.5
 # planks; with ID_SSAA >= 2 those gaps resolve smoothly instead.
 ID_SSAA = 4
 
-# Roads/beaches coverage bake: supersampling rate per pixel side and
+# Roads coverage bake: supersampling rate per pixel side and
 # terrain drop (m). Terrain is temporarily lowered by this amount and
 # added as an occluder so underground artefact splines buried deeper
 # than the drop get culled while surface roads still read through.
@@ -390,7 +465,7 @@ CATEGORY_COLORS: Dict[str, str] = {
 # Spline placement: which mesh names belong to which spline category.
 # 3_blend_spills.py places these into the focus region's .blend under
 # collection 'splines/<category>/'. 4_render_spills.py uses the
-# t1_road / t2_road / t3_road / beach categories specially (see below).
+# t1_road / t2_road / t3_road categories specially (see below).
 SPLINE_CATEGORIES: Dict[str, list] = {
     "t1_road": [
         "Meshes__Environment__Roads__RoadT1Dirt01",
@@ -406,19 +481,15 @@ SPLINE_CATEGORIES: Dict[str, list] = {
         "Meshes__Environment__Roads__RoadGreatMarch01",
         "Meshes__Environment__Roads__RoadGreatMarch01Snow",
     ],
-    "beach": [
-        "Engine__Content__EditorLandscapeResources__SplineEditorMesh",
-    ],
 }
 
-# Per-spline-category colors used by the 'roads' / 'beaches' renders in
+# Per-spline-category colors used by the 'roads' render in
 # 4_render_spills.py. Entries without a color here fall back to the
 # generic 'splines' color.
 SPLINE_COLORS: Dict[str, str] = {
     "t1_road":                 "#A2B4C1",
     "t2_road":                 "#C1AD83",
     "t3_road":                 "#B48780",
-    "beach":                   "#B6A177",
 }
 
 # Depth-graded dive_alert overlay in 5_finalize_exports.py. Each entry maps
@@ -522,6 +593,7 @@ SVG_LAYERS: Dict[str, list] = {
     "ranges_mh":     ["ranges_mh"],
     "ranges_tap":    ["ranges_tap"],
     "wells":         ["wells"],
+    "ladders":       ["ladders"],
     "foliage":       ["foliage_low", "foliage_medium", "foliage_tall"],
     "foliage_invis": ["foliage_invis"],
     "rdz_grace":     ["rdz_grace"],
@@ -531,7 +603,6 @@ SVG_LAYERS: Dict[str, list] = {
     "runways":       ["runways"],
     "runways_aim":   ["runways_aim"],
     "garrisons":     ["garrisons"],
-#    "ladders":       ["ladders"],
 }
 
 # ------------------------------------------------------------------------------

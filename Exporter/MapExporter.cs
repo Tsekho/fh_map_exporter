@@ -92,6 +92,16 @@ namespace Exporter
             if (assetPath.EndsWith(".umap", StringComparison.OrdinalIgnoreCase))
                 assetPath = assetPath[..^5];
 
+            string mapName = assetPath.Split('/', '\\').Last();
+
+            // Proxy maps are lightweight blending regions nothing downstream reads;
+            // skip them before paying for the package load.
+            if (mapName.StartsWith("Proxy", StringComparison.OrdinalIgnoreCase))
+            {
+                Log.Information("Skipping proxy map: {0}", assetPath);
+                return;
+            }
+
             Log.Information("Loading package: {0}", assetPath);
 
             if (!_provider.TryLoadPackage(assetPath, out var pkg))
@@ -106,7 +116,6 @@ namespace Exporter
                 return;
             }
 
-            string mapName = assetPath.Split('/', '\\').Last();
             Log.Information("Processing '{0}'  ({1} exports)", mapName, p.ExportMap.Length);
 
             // 1. Build flat item list
@@ -203,11 +212,7 @@ namespace Exporter
                 ["splines"]    = ToJObject(splines),
             };
 
-            // Proxy maps are lightweight blending regions; keep their JSON in a
-            // dedicated subfolder so they don't mix with real region exports.
             string jsonDir = Path.Combine(_exportFolder, "_json");
-            if (mapName.StartsWith("Proxy", StringComparison.OrdinalIgnoreCase))
-                jsonDir = Path.Combine(jsonDir, "proxies");
             Directory.CreateDirectory(jsonDir);
             string outPath = Path.Combine(jsonDir, mapName + ".json");
             File.WriteAllText(outPath, JsonOutput.Serialize(output));

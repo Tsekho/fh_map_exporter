@@ -422,7 +422,7 @@ def _build_bvh_core(
     When ``cull`` is given, objects and then individual triangles whose
     XY extent misses every pixel that will be cast are dropped. Rays are
     vertical, so this cannot change any hit -- it just keeps the sparse
-    bakes (roads at 9.4% of the tile, beaches at 1.7%) from building an
+    bakes (roads cover ~9% of the tile) from building an
     11M-triangle tree they barely touch.
     """
     from mathutils.bvhtree import BVHTree
@@ -1097,8 +1097,7 @@ def bake_spline_layer(
     drop lets surface splines read through while burying any
     far-underground artefact splines below the lowered terrain. When
     ``terrain_occluders`` is None/empty, terrain is not included at
-    all (used e.g. for beaches, which should never be occluded by
-    terrain).
+    all.
 
     Writes a blank-but-empty-friendly bake if ``targets`` is empty
     (``raycast_coverage_rgba`` handles the empty-BVH case). Returns

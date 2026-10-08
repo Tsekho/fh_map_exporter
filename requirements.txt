@@ -2,3 +2,5 @@ numpy
 opencv-python
 bpy
 cairosvg
+etcpak
+texture2ddecoder

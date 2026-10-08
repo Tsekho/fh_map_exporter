@@ -7,9 +7,7 @@ __*
 *.csproj.lscache
 
 /export/*
-!/export/_extra/
 !/export/hashes.txt
-!/export/h.py
 
-/utils/svg/ladders
 /assembly/
+*.pak
