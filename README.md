@@ -1,19 +1,19 @@
 # Foxhole Map Exporter
 
-Tools for exporting the world of [Foxhole](https://store.steampowered.com/app/505460/Foxhole/)
-and turning it into custom map mods. Updated for U67.
+Exporting [Foxhole](https://store.steampowered.com/app/505460/Foxhole/) maps and full pipeline for map mod creation. Updated for U67.
 
-The repo has two halves:
+Every stage leaves something usable behind, so you can stop wherever your
+project does:
 
-- **The pipeline** (steps 0-5) reads the game's `.pak`, rebuilds every region
-  in Blender, bakes it top-down and stitches the bakes into world-sized
-  layers: terrain, roads, structures, ranges, alerts and more.
-- **The toolset** (step 6) takes a world image (one you composed from those
-  layers, or anything else drawn on the same canvas) and turns it into a map
-  mod. It also breaks mods and world images back apart.
+| You want | Stop at | You get |
+|---|---|---|
+| Raw game data | [Step 1](#step-1---export-game-files) | Per-region JSON of every placed object and spline, meshes as `.pskx`/`.psk`, 16-bit heightmaps, terrain weightmaps |
+| 3D scenes | [Steps 2-3](#step-2---generate-blender-scenes) | Each region (or the whole map) assembled in Blender: terrain, water, structures, roads, ready for renders, flythroughs or other 3D work |
+| Map imagery | [Steps 4-5](#step-4---render-region-bakes) | World-sized PNG layers on one shared canvas: terrain, heightmaps, contours, roads, beaches, structures, ranges, alerts and more |
+| A map mod | [Step 6](#step-6---toolset) | A `.pak` that replaces the in-game map with an image you composed from those layers, or anything else drawn on the same canvas |
 
-You don't need to run the pipeline to make a mod: the finished layers are
-published with every [release](https://github.com/Tsekho/fh_map_exporter/releases/latest).
+The finished layers are published with every
+[release](https://github.com/Tsekho/fh_map_exporter/releases/latest).
 
 ### Credits
 
@@ -367,13 +367,11 @@ from the current directory or pasted as a path.
 A region folder may hold only some regions: a mod built from it replaces
 just those and leaves the rest of the map as the game draws it. Folder
 images may be 2048×1776 or a full 2048×2048 hex (trimmed automatically).
-`unpack` reads mods built here or with the older `fh_map_mod_generator`.
-Paks made by other tools may use a newer format, which it refuses with an
+`unpack` reads mods built here. Paks made by other tools may use a newer format, which it refuses with an
 error rather than misreading.
 
 Textures are compressed to BC7 with [etcpak](https://github.com/K0lb3/etcpak)'s
 build of bc7enc, spread over every core (a full map takes a few seconds).
-The output is byte-identical to the old Cython encoder's.
 
 #### Recipes
 
